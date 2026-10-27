@@ -1,0 +1,11 @@
+[project]
+name = "mirror"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "jax==0.4.30",
+    "jaxlib==0.4.30",
+    "mediapipe==0.10.21",
+    "numpy<2",
+    "opencv-python>=4.8,<5",
+]
