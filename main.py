@@ -5,6 +5,8 @@ import mediapipe as mp
 
 from geometry import distance, midpoint, tilt_angle, transform_point
 from glasses import draw_glasses
+from head_pose import (camera_matrix, draw_pose_axes, estimate_head_pose,
+                       euler_angles, image_points_from_landmarks)
 
 # Glasses attachment landmarks (MediaPipe Face Mesh IDs).
 # The frame is flipped before it reaches MediaPipe, so "left" and "right"
@@ -36,7 +38,7 @@ def landmark_to_pixel(landmark, width, height):
 
 
 def draw_debug(frame, left_point, right_point, bridge_point, eye_midpoint,
-               eye_distance, angle, glasses_center):
+               eye_distance, angle, glasses_center, pose):
     """Draw tracked landmarks and measurements for debugging."""
     cv2.circle(frame, left_point, 4, BLUE, -1)
     cv2.circle(frame, right_point, 4, BLUE, -1)
@@ -48,7 +50,14 @@ def draw_debug(frame, left_point, right_point, bridge_point, eye_midpoint,
         f"tilt: {math.degrees(angle):+.1f} deg",
         f"glasses center: ({glasses_center[0]:.0f}, {glasses_center[1]:.0f})",
     ]
-    cv2.rectangle(frame, (8, 8), (270, 16 + 22 * len(lines)), (0, 0, 0), -1)
+    if pose is None:
+        lines.append("3D pose: not available")
+    else:
+        yaw, pitch, roll = euler_angles(pose.rotation_matrix)
+        tx, ty, tz = pose.translation_vector.ravel()
+        lines.append(f"yaw {yaw:+.0f}  pitch {pitch:+.0f}  roll {roll:+.0f} deg")
+        lines.append(f"translation: ({tx:.1f}, {ty:.1f}, {tz:.1f}) cm*")
+    cv2.rectangle(frame, (8, 8), (320, 16 + 22 * len(lines)), (0, 0, 0), -1)
     for i, text in enumerate(lines):
         cv2.putText(frame, text, (16, 30 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, WHITE, 1, cv2.LINE_AA)
@@ -62,7 +71,11 @@ face_mesh = mp_face_mesh.FaceMesh(
 )
 
 camera = cv2.VideoCapture(0)
-debug_mode = False
+show_glasses = True   # G
+show_pose_axes = False  # P
+debug_mode = False    # D
+camera_intrinsics = None
+intrinsics_size = None  # rebuild the camera matrix only if the frame size changes
 required_landmarks = max(LEFT_EYE_OUTER, RIGHT_EYE_OUTER, NOSE_BRIDGE) + 1
 
 while True:
@@ -73,6 +86,9 @@ while True:
 
     frame = cv2.flip(frame, 1)
     height, width = frame.shape[:2]
+    if intrinsics_size != (width, height):
+        camera_intrinsics = camera_matrix(width, height)
+        intrinsics_size = (width, height)
 
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb_frame)
@@ -90,16 +106,26 @@ while True:
         eye_midpoint = midpoint(left_point, right_point)  # reference only
         angle = tilt_angle(left_point, right_point)
 
+        # Only run the 3D solver when something will use the result.
+        pose = None
+        if show_pose_axes or debug_mode:
+            image_points = image_points_from_landmarks(landmarks, width, height)
+            pose = estimate_head_pose(image_points, camera_intrinsics)
+
         # A zero distance would collapse the glasses to a single point.
         if eye_distance > 0:
             glasses_width = eye_distance * GLASSES_WIDTH_SCALE
             glasses_center = transform_point(GLASSES_OFFSET, glasses_width, angle,
                                              bridge_point)
-            draw_glasses(frame, glasses_center, glasses_width, angle)
+            if show_glasses:
+                draw_glasses(frame, glasses_center, glasses_width, angle)
 
             if debug_mode:
                 draw_debug(frame, left_point, right_point, bridge_point,
-                           eye_midpoint, eye_distance, angle, glasses_center)
+                           eye_midpoint, eye_distance, angle, glasses_center, pose)
+
+        if show_pose_axes and pose is not None:
+            draw_pose_axes(frame, pose)
 
     cv2.imshow("Mirror", frame)
 
@@ -108,6 +134,10 @@ while True:
         break
     if key in (ord("d"), ord("D")):
         debug_mode = not debug_mode
+    if key in (ord("g"), ord("G")):
+        show_glasses = not show_glasses
+    if key in (ord("p"), ord("P")):
+        show_pose_axes = not show_pose_axes
 
 camera.release()
 cv2.destroyAllWindows()
