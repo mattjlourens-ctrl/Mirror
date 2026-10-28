@@ -73,8 +73,8 @@ def has_3d_glasses(frame):
 
 class MainLoopTests(unittest.TestCase):
     def test_no_face_does_not_crash(self):
-        _, shown = run_app([NO_KEY, "d", "p", "h", NO_KEY])
-        self.assertEqual(len(shown), 5)
+        _, shown = run_app([NO_KEY, "d", "p", "h", "o", NO_KEY])
+        self.assertEqual(len(shown), 6)
         self.assertFalse(has_3d_glasses(shown[-1]))
 
     def test_q_quits_immediately(self):
@@ -82,7 +82,8 @@ class MainLoopTests(unittest.TestCase):
         self.assertEqual(len(shown), 1)
 
     def test_toggle_keys(self):
-        app_globals, _ = run_app(["d", "p", "g", "H"])
+        app_globals, _ = run_app(["d", "p", "g", "H", "O"])
+        self.assertFalse(app_globals["show_occlusion"])
         self.assertTrue(app_globals["debug_mode"])
         self.assertTrue(app_globals["show_pose_axes"])
         self.assertFalse(app_globals["show_glasses_2d"])
@@ -92,6 +93,15 @@ class MainLoopTests(unittest.TestCase):
         app_globals, _ = run_app([NO_KEY])
         self.assertTrue(app_globals["show_glasses_2d"])
         self.assertFalse(app_globals["show_glasses_3d"])
+        self.assertTrue(app_globals["show_occlusion"])
+
+    def test_occlusion_hides_part_of_the_3d_glasses(self):
+        # 3D glasses only, occlusion on, then off.
+        _, shown = run_app(["g", "h", "o", NO_KEY], face=fake_face_landmarks())
+        occluded, unoccluded = shown[2], shown[3]
+        self.assertTrue(has_3d_glasses(occluded))
+        magenta = lambda f: ((f[..., 0] > 200) & (f[..., 2] > 200) & (f[..., 1] < 80)).sum()
+        self.assertLess(magenta(occluded), magenta(unoccluded))
 
     def test_g_and_h_toggle_independently_with_a_face(self):
         # A key takes effect on the frame AFTER the one it was pressed on.

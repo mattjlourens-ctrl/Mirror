@@ -9,6 +9,7 @@ from glasses import draw_glasses
 from glasses_3d import DEFAULT_GLASSES_ATTACHMENT, build_glasses_model, draw_wireframe
 from head_pose import (camera_matrix, draw_pose_axes, estimate_head_pose,
                        euler_angles, image_points_from_landmarks)
+from occlusion import load_head_occluder, render_depth_buffer
 
 # Glasses attachment landmarks (MediaPipe Face Mesh IDs).
 # The frame is flipped before it reaches MediaPipe, so "left" and "right"
@@ -60,7 +61,7 @@ def draw_debug(frame, left_point, right_point, bridge_point, eye_midpoint,
         tx, ty, tz = pose.translation_vector.ravel()
         lines.append(f"yaw {yaw:+.0f}  pitch {pitch:+.0f}  roll {roll:+.0f} deg")
         lines.append(f"translation: ({tx:.1f}, {ty:.1f}, {tz:.1f}) cm*")
-    cv2.rectangle(frame, (8, 8), (400, 16 + 22 * len(lines)), (0, 0, 0), -1)
+    cv2.rectangle(frame, (8, 8), (530, 16 + 22 * len(lines)), (0, 0, 0), -1)
     for i, text in enumerate(lines):
         cv2.putText(frame, text, (16, 30 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, WHITE, 1, cv2.LINE_AA)
@@ -78,10 +79,12 @@ glasses_model = build_glasses_model()
 glasses_to_face = attachment_matrix(DEFAULT_GLASSES_ATTACHMENT,
                                     glasses_model.units_to_cm,
                                     glasses_model.orientation)
+head_occluder = load_head_occluder()  # None if the model file is missing
 
 camera = cv2.VideoCapture(0)
 show_glasses_2d = True   # G
 show_glasses_3d = False  # H
+show_occlusion = True    # O: hide 3D glasses parts that are behind the head
 show_pose_axes = False  # P
 debug_mode = False    # D
 camera_intrinsics = None
@@ -131,11 +134,15 @@ while True:
                 draw_glasses(frame, glasses_center, glasses_width, angle)
 
         if show_glasses_3d:
-            draw_wireframe(frame, glasses_model, glasses_to_face, pose)
+            depth_buffer = None
+            if show_occlusion:
+                depth_buffer = render_depth_buffer(head_occluder, pose, width, height)
+            draw_wireframe(frame, glasses_model, glasses_to_face, pose, depth_buffer)
 
         if debug_mode and eye_distance > 0:
             status = (f"2D glasses [G]: {'on' if show_glasses_2d else 'off'}  "
-                      f"3D glasses [H]: {'on' if show_glasses_3d else 'off'}")
+                      f"3D glasses [H]: {'on' if show_glasses_3d else 'off'}  "
+                      f"occlusion [O]: {'on' if show_occlusion else 'off'}")
             draw_debug(frame, left_point, right_point, bridge_point,
                        eye_midpoint, eye_distance, angle, glasses_center, pose, status)
 
@@ -153,6 +160,8 @@ while True:
         show_glasses_2d = not show_glasses_2d
     if key in (ord("h"), ord("H")):
         show_glasses_3d = not show_glasses_3d
+    if key in (ord("o"), ord("O")):
+        show_occlusion = not show_occlusion
     if key in (ord("p"), ord("P")):
         show_pose_axes = not show_pose_axes
 

@@ -11,12 +11,17 @@ These match the face-local axes in head_pose.py, so a model at its origin
 sits on the attachment point facing the same way as the face.
 """
 from dataclasses import dataclass, field
+from functools import cached_property
 import math
 
 import cv2
 import numpy as np
 
 from accessory_transform import Attachment, project_accessory
+from occlusion import sample_lines, visible_line_segments
+
+# Spacing of the depth-tested samples along each edge.
+SAMPLE_SPACING_CM = 0.25
 
 MAGENTA = (255, 0, 255)  # BGR
 
@@ -32,6 +37,12 @@ class WireframeModel:
     color: tuple = MAGENTA      # style metadata (BGR)
     line_thickness: int = 2
 
+    @cached_property
+    def line_samples(self):
+        """Edge samples for occlusion; computed once per model, on first use."""
+        return sample_lines(self.vertices, self.edges,
+                            SAMPLE_SPACING_CM / self.units_to_cm)
+
 
 @dataclass(frozen=True)
 class GlassesDimensions:
@@ -42,6 +53,7 @@ class GlassesDimensions:
     temple_length: float = 14.0  # how far the arms reach back from the hinges
     wrap_depth: float = 0.5      # how far the outer lens edges curve back
     ear_drop: float = 1.5        # how far the arm tips bend down behind the ears
+    temple_spread: float = 1.6   # how far each arm splays outwards by the ear bend
     lens_segments: int = 24      # points per lens outline
 
     @property
@@ -113,12 +125,14 @@ def build_glasses_model(dims=GlassesDimensions()):
     vertices.append((0.0, bridge_y + 0.4, 0.0))
     edges += [(left_inner, bridge_top), (bridge_top, right_inner)]
 
-    # Temples: straight back from each hinge (-Z), then bend down at the ear.
-    for hinge in (left_hinge, right_hinge):
+    # Temples: back from each hinge (-Z), splaying outwards to clear the side
+    # of the head, then bending down at the ear.
+    for hinge, outwards in ((left_hinge, -1.0), (right_hinge, 1.0)):
         hx, hy, hz = vertices[hinge]
+        ear_x = hx + outwards * dims.temple_spread
         bend = len(vertices)
-        vertices.append((hx, hy, hz - 0.85 * dims.temple_length))
-        vertices.append((hx, hy - dims.ear_drop, hz - dims.temple_length))
+        vertices.append((ear_x, hy, hz - 0.85 * dims.temple_length))
+        vertices.append((ear_x, hy - dims.ear_drop, hz - dims.temple_length))
         edges += [(hinge, bend), (bend, bend + 1)]
 
     return WireframeModel(
@@ -140,9 +154,21 @@ def projected_segments(model, accessory_to_face, pose):
     return np.round(segments[drawable]).astype(np.int32)
 
 
-def draw_wireframe(frame, model, accessory_to_face, pose):
-    """Draw the model; returns False (and draws nothing) without a valid pose."""
-    segments = projected_segments(model, accessory_to_face, pose)
+def draw_wireframe(frame, model, accessory_to_face, pose, depth_buffer=None):
+    """Draw the model; returns False (and draws nothing) without a valid pose.
+
+    With a depth buffer (see occlusion.py), parts behind the head are hidden.
+    """
+    if pose is None:
+        return False
+    if depth_buffer is None:
+        segments = projected_segments(model, accessory_to_face, pose)
+    else:
+        segments = visible_line_segments(model.line_samples,
+                                         pose.transform @ accessory_to_face,
+                                         pose.camera_matrix, depth_buffer)
+        on_canvas = (np.abs(segments) < 1e5).all(axis=(1, 2))
+        segments = np.round(segments[on_canvas]).astype(np.int32)
     if segments is None or len(segments) == 0:
         return False
     cv2.polylines(frame, list(segments), False, model.color,

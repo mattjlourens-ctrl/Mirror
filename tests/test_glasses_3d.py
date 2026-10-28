@@ -64,7 +64,8 @@ class ModelDefinitionTests(unittest.TestCase):
 class DimensionTests(unittest.TestCase):
     def test_default_dimensions(self):
         v = MODEL.vertices
-        self.assertAlmostEqual(v[:, 0].max() - v[:, 0].min(), DIMS.frame_width)
+        lenses = v[:2 * N]
+        self.assertAlmostEqual(lenses[:, 0].max() - lenses[:, 0].min(), DIMS.frame_width)
         lens_y = v[LEFT_LENS, 1]
         self.assertAlmostEqual(lens_y.max() - lens_y.min(), DIMS.lens_height)
         self.assertAlmostEqual(v[RIGHT_LENS, 0].min() - v[LEFT_LENS, 0].max(),
@@ -80,9 +81,17 @@ class DimensionTests(unittest.TestCase):
     def test_custom_dimensions_change_the_model(self):
         dims = GlassesDimensions(frame_width=12.0, lens_height=3.0, temple_length=10.0)
         v = build_glasses_model(dims).vertices
-        self.assertAlmostEqual(v[:, 0].max() - v[:, 0].min(), 12.0)
+        lenses = v[:2 * dims.lens_segments]
+        self.assertAlmostEqual(lenses[:, 0].max() - lenses[:, 0].min(), 12.0)
         self.assertAlmostEqual(np.ptp(v[:dims.lens_segments, 1]), 3.0)
         self.assertLess(v[:, 2].min(), -10.0)
+
+    def test_temples_splay_outwards(self):
+        # The last four vertices are each temple's ear bend and tip.
+        hinge_x = MODEL.vertices[MODEL.edges[MODEL.edges[:, 1] == len(MODEL.vertices) - 4][0, 0], 0]
+        left_bend_x, right_bend_x = MODEL.vertices[[-4, -2], 0]
+        self.assertAlmostEqual(left_bend_x, hinge_x - DIMS.temple_spread)
+        self.assertAlmostEqual(right_bend_x, -left_bend_x)
 
     def test_invalid_dimensions_are_rejected(self):
         for bad in (GlassesDimensions(frame_width=0), GlassesDimensions(bridge_width=20),
