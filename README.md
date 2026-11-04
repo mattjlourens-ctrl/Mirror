@@ -108,6 +108,7 @@ Mirror/
 ├── glasses_3d.py            # Procedural 3D glasses model and wireframe renderer
 ├── occlusion.py             # Head proxy mesh, depth-buffer rasterizer, visibility tests
 ├── face_landmarker.task     # MediaPipe model bundle (source of the canonical face mesh)
+├── image_to_3d/             # Standalone: glasses image -> shallow .glb mesh (not used by main.py yet)
 ├── tests/                   # Unit and integration tests
 ├── pyproject.toml
 └── uv.lock
@@ -145,6 +146,17 @@ A window titled **Mirror** opens with the camera feed. The app starts with the 2
 
 **To exit,** press **Q** with the Mirror window focused.
 
+## Image to 3D
+
+`image_to_3d` converts a front-facing PNG or JPG of glasses on a white or transparent background into a basic shallow mesh. It is separate from the AR pipeline: neither imports the other.
+
+```bash
+uv run python image_to_3d/mirror_image_to_3d.py --demo
+uv run python image_to_3d/mirror_image_to_3d.py glasses.png -o glasses.glb --frame-width 14 --thickness 0.4
+```
+
+The mesh is an extrusion of the front silhouette, sized from the width you supply. It is an approximation, not a physically accurate reconstruction: temples, lenses, curvature, and true depth are not recovered. The GLB is in metres with the same axes as `glasses_3d.py` (Y up, Z forward).
+
 ## Keyboard Controls
 
 | Key | Action | Default |
@@ -164,12 +176,13 @@ Mirror has unit tests for the math and rendering stages, plus an integration tes
 uv run python -m unittest discover -s tests -v
 ```
 
-Current result: **103 tests, all passing.** They cover:
+Current result: **180 tests, all passing.** They cover:
 
 - 2D geometry and transforms
 - Head-pose recovery from synthetic faces, reprojection-error rejection, and Euler-angle signs
 - Glasses model construction, dimension validation, and projection
 - Depth-buffer rasterization, visibility, and line clipping at occluder edges and the near plane
+- Image-to-3D: image loading failures, segmentation, mesh validity and preserved openings, GLB export, and the command line
 - The full app loop and every keyboard toggle
 
 ## Current Limitations

@@ -5,7 +5,10 @@ requires-python = ">=3.11"
 dependencies = [
     "jax==0.4.30",
     "jaxlib==0.4.30",
+    "mapbox-earcut>=2.1.0",
     "mediapipe==0.10.21",
     "numpy<2",
     "opencv-python>=4.8,<5",
+    "shapely>=2.2.0",
+    "trimesh>=5.2.0",
 ]
