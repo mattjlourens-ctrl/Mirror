@@ -108,7 +108,7 @@ Mirror/
 ├── glasses_3d.py            # Procedural 3D glasses model and wireframe renderer
 ├── occlusion.py             # Head proxy mesh, depth-buffer rasterizer, visibility tests
 ├── face_landmarker.task     # MediaPipe model bundle (source of the canonical face mesh)
-├── image_to_3d/             # Standalone: glasses image -> shallow .glb mesh (not used by main.py yet)
+├── image_to_3d/             # Standalone: glasses image -> approximate 3D .glb (not used by main.py yet)
 ├── tests/                   # Unit and integration tests
 ├── pyproject.toml
 └── uv.lock
@@ -148,14 +148,121 @@ A window titled **Mirror** opens with the camera feed. The app starts with the 2
 
 ## Image to 3D
 
-`image_to_3d` converts a front-facing PNG or JPG of glasses on a white or transparent background into a basic shallow mesh. It is separate from the AR pipeline: neither imports the other.
+`image_to_3d` turns a front-facing PNG or JPG of glasses on a white or transparent background into a 3D model. It is separate from the AR pipeline: neither imports the other, and `main.py` does not load these models yet.
+
+All geometry comes from deterministic mathematics and classical image processing, with no machine learning, depth estimation, or external services. The same image and parameters produce a byte-identical file.
+
+> **This is an approximation, not a reconstruction.** One frontal photo says nothing reliable about depth or anything hidden behind the frame, so most of the 3D shape is estimated from parameters.
+
+### What comes from where
+
+| Part | Source |
+|---|---|
+| Frame outline and lens openings | **The photo** |
+| Hinge and nose-pad positions, and the bridge when the frame has one | **The photo**, estimated from the outline |
+| Overall size | **You** (`--frame-width`); one image has no absolute scale |
+| Frame depth and wrap curvature | **Procedural** |
+| Temple arms, hinge shapes, nose-pad shapes | **Procedural** |
+| Bridge, if the outline has none joining the rims | **Procedural** |
+| Colour and materials | **Fixed placeholders**, not taken from the photo |
+
+### Usage
 
 ```bash
-uv run python image_to_3d/mirror_image_to_3d.py --demo
-uv run python image_to_3d/mirror_image_to_3d.py glasses.png -o glasses.glb --frame-width 14 --thickness 0.4
+# Original shallow front frame only (still the default)
+uv run python image_to_3d/mirror_image_to_3d.py glasses.png -o glasses.glb
+
+# Complete model
+uv run python image_to_3d/mirror_image_to_3d.py glasses.png --complete -o model.glb
+
+# Adjusted model with nose pads and a shorter left arm
+uv run python image_to_3d/mirror_image_to_3d.py glasses.png --complete --nose-pads \
+    --frame-width 13.5 --frame-curvature 0.8 --temple-length 14.5 --left-temple-length 14
+
+# Flat front with straight temples, from a generated sample image
+uv run python image_to_3d/mirror_image_to_3d.py --demo --complete -o flat.glb \
+    --frame-curvature 0 --temple-curvature 0 --temple-splay 0 --temple-ear-drop 0
 ```
 
-The mesh is an extrusion of the front silhouette, sized from the width you supply. It is an approximation, not a physically accurate reconstruction: temples, lenses, curvature, and true depth are not recovered. The GLB is in metres with the same axes as `glasses_3d.py` (Y up, Z forward).
+### Parameters
+
+Lengths are in centimetres. Values are validated, and bad ones exit with an error without writing a file. The `--complete` group is rejected without `--complete`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--frame-width` | 14.0 | Frame width, outer edge to outer edge. Excludes the temples' splay |
+| `--frame-thickness`, `--thickness` | 0.4 | Front to rear depth along Z |
+| `--white-threshold` | 240 | Pixels with every channel at or above this are background. With `--complete` and no explicit value, it adapts downward to halfway between the frame and white |
+| `--alpha-threshold` | 200 | Pixels with alpha below this are background |
+| `--complete` | off | Build the full model |
+| `--frame-curvature` | 0.5 | How far the outer edges sit behind the centre, up to a quarter of the frame width |
+| `--temple-length` | 14.0 | Measured along the arm from hinge to tip, like the size printed on real temples |
+| `--temple-width` | 0.55 | Arm height |
+| `--temple-thickness` | 0.25 | Arm depth, across its side |
+| `--temple-splay` | 1.6 | Outward offset at the ear bend. The default clears Mirror's head proxy, which is wider than a 14 cm frame, so arms show past the frame from the front |
+| `--temple-curvature` | 0.4 | How far the tip curves back in from the ear bend |
+| `--temple-ear-drop` | 1.5 | How far the tip falls below the hinge |
+| `--left-temple-*`, `--right-temple-*` | | Override any temple option for one arm. Left and right mean screen-left and screen-right, as elsewhere in Mirror |
+| `--nose-pads` | off | Add separate nose pads. Off by default because many frames, such as moulded acetate, have none |
+| `--opening-cleanup` | 0.04 | Remove strips narrower than this fraction of the frame width from lens openings; 0 disables |
+
+### How each part is built
+
+- **Silhouette.** The mask comes from OpenCV segmentation, then `findContours` traces outer edges and holes into polygons. For complete models, each opening is morphologically closed on its own, which removes thin strips bounded by that opening on both sides (typically the real temples seen through the lens) but cannot erode a rim, because a rim's far side isn't part of the opening.
+- **Curved front.** The outline is extruded with constrained Delaunay caps, which avoid the zero-area triangles that pixel-aligned outlines can otherwise produce, then sheared along Z only: `(x, y, z) -> (x, y, z + f(x))`, with `f(x) = -depth * (x / half_width)^2`, the curve `glasses_3d.py` already uses. A shear keeps X and Y, so the front view is still the traced outline. It is also one-to-one, so it can't create self-intersections. Since meshes only bend at vertices, faces are first split at evenly spaced planes of constant X. A chord of width `w` on `z = -a x^2` sags `a w^2 / 4` wherever it is, so the spacing follows directly from a 0.05 mm tolerance, and a flat frame gets no extra faces.
+- **Temples.** The centreline is two cubic Béziers sharing a tangent at the ear bend. The first stays level; the second drops and curves inward. Scaling the reach by fixed-point iteration makes the arc length match `--temple-length`. Adaptive de Casteljau subdivision keeps only the points the curve needs, so a straight arm is just two rings. A rounded-rectangle section is swept along it using rotation-minimising frames, so it doesn't twist. The left arm is the mirror image of the right.
+- **Hinges.** The anchor is at mid-height of the frame's outermost 2.5%, moved onto frame material if needed. A vertical cylinder sits behind the frame, and a box along the local surface normal joins them, reaching into the frame.
+- **Nose supports.** By default the nose rests on the bridge from the photo. If the rims aren't joined, a Bézier bar is generated between them. Optional pads are flattened ellipsoids on short arms, anchored on the rim on the nasal side of each opening and below its centre.
+
+### Assembly and validation
+
+The GLB has one named node per part: `front_frame`, `left_temple`, `right_temple`, `left_hinge`, `right_hinge`, and optionally `bridge`, `left_nose_pad`, `right_nose_pad`. It is an assembly of closed shells that deliberately overlap at joints, not one watertight solid.
+
+Before anything is written, each part is checked for non-finite vertices, degenerate triangles, non-manifold edges, inconsistent winding, and inward normals. Parts meant to touch must touch, all other pairs must not intersect, and the frame and temples must not intersect themselves. Any failure stops the export. The intersection test checks for surfaces crossing, so overlaps that are only coplanar, or a part entirely inside another, aren't detected.
+
+### Coordinates and connecting to the face tracker
+
+Models use the accessory-local axes from `glasses_3d.py` and `head_pose.py`. Conveniently these match glTF, so no axis conversion is needed:
+
+- **Origin:** centre of the frame's front view, on the front surface at `x = 0`
+- **X:** towards the screen-right lens. **Y:** up. **Z:** forward, away from the face, so the temples run towards -Z
+- **Units:** centimetres in memory, metres in the GLB, as glTF specifies
+
+Nothing in the live app uses these files yet. A future loader would read the GLB with Trimesh and use the existing transforms unchanged:
+
+```python
+attach = attachment_matrix(DEFAULT_GLASSES_ATTACHMENT, units_to_cm=100.0)
+pixels = project_accessory(vertices_in_metres, attach, pose)
+```
+
+The tests already run exported geometry through `attachment_matrix`, `transform_points`, and `projected_segments`. To display it, the app would also need either a wireframe built from the mesh edges or a triangle renderer. The attachment offset was calibrated for the procedural wireframe, so photo-based frames may need their own.
+
+### Modules
+
+| Module | Responsibility |
+|---|---|
+| `segmentation.py` | Load images, separate the frame from the background, clean up openings |
+| `mesh.py` | Trace polygons, scale to centimetres, flat extrusion, GLB writing |
+| `curvature.py` | Wrap curve, face splitting, curved front frame |
+| `sweep.py` | Bézier evaluation and flattening, swept tubes |
+| `temples.py` | Temple parameters, centreline, arm mesh |
+| `hinges.py` | Hinge and nose anchors, hinge, nose pad, and fallback bridge geometry |
+| `validation.py` | Topology checks and intersection tests |
+| `assembly.py` | Parameters, assembling components, export |
+| `pipeline.py` | Image-to-GLB conversions |
+| `mirror_image_to_3d.py` | Command line |
+
+### Limitations and assumptions
+
+- **Temple shape and length are defaults,** not measurements. Even the photographed temples are discarded when they show through the lenses.
+- **The front is a uniform-thickness sheet** with square edges. It has no rounded rims, bevels, or variation in thickness, and the wrap is one assumed curve.
+- **Hinges and pads are simplified stand-ins,** and hinge height is inferred from the outline's end piece, which can be wrong on unusual shapes.
+- **The photo must be frontal.** Tilt and perspective are baked into the outline.
+- **Lenses aren't modelled.** Dark or opaque lenses become solid; the tool warns when it finds no openings.
+- **Opening cleanup can remove real detail** narrower than the threshold, such as a decorative strip or a nose-pad arm, and can't remove an arm that crosses the whole opening.
+- **Backgrounds must be white or transparent.** Heavy shadows may still count as frame, and white frames on white can't be separated.
+- **Default temples flare outward** to clear the head proxy, so they look wider than real arms that flex around a head.
+- **Faces render flat-shaded** because no smooth normals are exported, so facets on the curved front may be visible.
 
 ## Keyboard Controls
 
@@ -176,13 +283,13 @@ Mirror has unit tests for the math and rendering stages, plus an integration tes
 uv run python -m unittest discover -s tests -v
 ```
 
-Current result: **180 tests, all passing.** They cover:
+Current result: **349 tests, all passing.** They cover:
 
 - 2D geometry and transforms
 - Head-pose recovery from synthetic faces, reprojection-error rejection, and Euler-angle signs
 - Glasses model construction, dimension validation, and projection
 - Depth-buffer rasterization, visibility, and line clipping at occluder edges and the near plane
-- Image-to-3D: image loading failures, segmentation, mesh validity and preserved openings, GLB export, and the command line
+- Image-to-3D: image loading failures, segmentation, wrap curvature, temples, hinges, nose supports, mesh topology, GLB export and reload, determinism, compatibility with Mirror's transforms, and the command line
 - The full app loop and every keyboard toggle
 
 ## Current Limitations
@@ -198,8 +305,7 @@ Current result: **180 tests, all passing.** They cover:
 
 Planned work, not yet implemented:
 
-- Photo-based glasses recognition and 3D reconstruction in Python
-- Procedural mesh generation from detected glasses contours
+- Loading `image_to_3d` models in the live app, with per-model calibration
 - Importing external 3D eyewear models (e.g. `.glb` / `.obj`)
 - More realistic frame materials and lens rendering
 - Tracking stabilization and smoothing

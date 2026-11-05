@@ -104,21 +104,29 @@ def mask_to_polygons(mask):
     return sorted(kept, key=lambda part: part.bounds[0])
 
 
+def scale_polygons_to_cm(polygons, frame_width):
+    """Working-pixel polygons -> centimetres: centred on the origin, Y up."""
+    if not polygons:
+        raise MeshBuildError("The silhouette has no area to build a mesh from")
+    min_x, min_y, max_x, max_y = MultiPolygon(polygons).bounds
+    scale = frame_width / (max_x - min_x)
+    # Negative Y scale flips image-down to mesh-up.
+    to_cm = [scale, 0, 0, -scale, -scale * (min_x + max_x) / 2, scale * (min_y + max_y) / 2]
+    return [affinity.affine_transform(polygon, to_cm) for polygon in polygons]
+
+
+def extrude_polygons(polygons_cm, thickness):
+    """One mesh from Z = 0 up to Z = thickness; each polygon is a closed shell."""
+    return trimesh.util.concatenate([
+        trimesh.creation.extrude_polygon(polygon, height=thickness, engine="earcut")
+        for polygon in polygons_cm])
+
+
 def polygons_to_mesh(polygons, dimensions=FrameDimensions()):
     """Extrude polygons into one mesh scaled and placed per the module docstring."""
     dimensions.validate()
-    if not polygons:
-        raise MeshBuildError("The silhouette has no area to build a mesh from")
-
-    min_x, min_y, max_x, max_y = MultiPolygon(polygons).bounds
-    scale = dimensions.frame_width / (max_x - min_x)
-    # Negative Y scale flips image-down to mesh-up.
-    to_mesh = [scale, 0, 0, -scale, -scale * (min_x + max_x) / 2, scale * (min_y + max_y) / 2]
-
-    parts = [trimesh.creation.extrude_polygon(affinity.affine_transform(polygon, to_mesh),
-                                              height=dimensions.thickness, engine="earcut")
-             for polygon in polygons]
-    mesh = trimesh.util.concatenate(parts)
+    polygons_cm = scale_polygons_to_cm(polygons, dimensions.frame_width)
+    mesh = extrude_polygons(polygons_cm, dimensions.thickness)
     mesh.apply_translation((0, 0, -dimensions.thickness))
     if not mesh.is_volume:
         raise MeshBuildError("The extruded silhouette is not a closed, consistent volume")
@@ -130,19 +138,23 @@ def build_frame_mesh(mask, dimensions=FrameDimensions()):
     return polygons_to_mesh(mask_to_polygons(mask), dimensions)
 
 
-def export_glb(mesh, path):
-    """Write the mesh, in metres, to a .glb file; returns the path written."""
+def write_glb(exportable, path):
+    """Write a mesh or scene that's already in metres; returns the path written."""
     path = Path(path)
     if path.suffix.lower() != ".glb":
         raise ValueError(f"Output file must end in .glb: {path}")
-    if mesh.is_empty:
+    if exportable.is_empty:
         raise MeshBuildError("Cannot export an empty mesh")
-
-    metres = mesh.copy()
-    metres.apply_scale(CM_TO_M)
-    data = metres.export(file_type="glb")
+    data = exportable.export(file_type="glb")
     if not data:
         raise MeshBuildError("Trimesh produced an empty GLB")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
+
+
+def export_glb(mesh, path):
+    """Write the mesh, in metres, to a .glb file; returns the path written."""
+    metres = mesh.copy()
+    metres.apply_scale(CM_TO_M)
+    return write_glb(metres, path)

@@ -14,12 +14,16 @@ JPEG_SIGNATURE = b"\xff\xd8\xff"
 MIN_BORDER_BACKGROUND_FRACTION = 0.5
 # Specks and pinholes are small relative to the frame itself.
 MIN_FEATURE_FRACTION = 0.002
+MAX_INTRUSION_FRACTION = 0.2
 
 
 @dataclass(frozen=True)
 class SegmentationConfig:
     white_threshold: int = 240  # a pixel with every channel at or above this is background
     alpha_threshold: int = 200  # a pixel with alpha below this is background (tinted lenses)
+    # Lower the white threshold to halfway between the frame and white, which is
+    # where a real edge lies; faint drop shadows then fall on the background side.
+    adaptive_white: bool = False
 
     def validate(self):
         for threshold in (self.white_threshold, self.alpha_threshold):
@@ -71,10 +75,14 @@ def _border(array):
 
 
 def _foreground_from_white(bgr, config):
-    foreground = bgr.min(axis=2) < config.white_threshold
+    darkest_channel = bgr.min(axis=2)
+    foreground = darkest_channel < config.white_threshold
     if (~_border(foreground)).mean() < MIN_BORDER_BACKGROUND_FRACTION:
         raise SegmentationError("The image background is not white or transparent; "
                                 "this version cannot isolate glasses from it")
+    if config.adaptive_white and foreground.any():
+        midpoint = (np.median(darkest_channel[foreground]) + 255) / 2
+        foreground = darkest_channel < min(midpoint, config.white_threshold)
     return foreground
 
 
@@ -120,3 +128,35 @@ def segment_glasses(image, config=SegmentationConfig()):
 
     mask = foreground.astype(np.uint8) * 255
     return _fill_pinholes(_remove_specks(mask))
+
+
+def remove_opening_intrusions(mask, width_fraction):
+    """Open up strips that poke into lens openings, such as temples seen through a lens.
+
+    Each opening is morphologically closed on its own with a disk this fraction of
+    the frame's width across. Closing only fills gaps bounded by that opening on
+    both sides, so strips narrower than the disk go, while rims survive however
+    thin they are: the far side of a rim isn't part of the opening.
+    """
+    if not 0 <= width_fraction <= MAX_INTRUSION_FRACTION:
+        raise ValueError(f"opening cleanup must be in 0..{MAX_INTRUSION_FRACTION}")
+    columns = np.flatnonzero(mask.any(axis=0))
+    diameter = round(width_fraction * (columns[-1] - columns[0] + 1)) if len(columns) else 0
+    if diameter < 2:
+        return mask.copy()
+    diameter |= 1  # an even kernel has no centre pixel, so closing would shift the shape
+
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diameter, diameter))
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(255 - mask, connectivity=4)
+    # Label 0 is the frame itself; labels on the image edge are the outside.
+    openings = set(range(1, len(stats))) - set(np.unique(_border(labels)).tolist())
+    cleaned = mask.copy()
+    for label in sorted(openings):
+        left, top, width, height, _ = stats[label]
+        # Padded so the closing never meets the edge of its working window.
+        window = np.pad(labels[top:top + height, left:left + width] == label, diameter)
+        closed = cv2.morphologyEx(window.astype(np.uint8), cv2.MORPH_CLOSE, disk)
+        y_min, x_min = top - diameter, left - diameter
+        ys, xs = np.nonzero(closed)
+        cleaned[ys + y_min, xs + x_min] = 0
+    return cleaned
