@@ -1,14 +1,21 @@
+import argparse
+from dataclasses import fields
 import math
+import sys
+import time
 
 import cv2
 import mediapipe as mp
 
 from accessory_transform import attachment_matrix
+from fit_controls import FitAdjustment, apply_fit_key, fit_flags, fit_matrix
 from geometry import distance, midpoint, tilt_angle, transform_point
 from glasses import draw_glasses
 from glasses_3d import DEFAULT_GLASSES_ATTACHMENT, build_glasses_model, draw_wireframe
+from glb_model import ModelLoadError, load_glasses_model
 from head_pose import (camera_matrix, draw_pose_axes, estimate_head_pose,
                        euler_angles, image_points_from_landmarks)
+from mesh_renderer import render_mesh
 from occlusion import load_head_occluder, render_depth_buffer
 
 # Glasses attachment landmarks (MediaPipe Face Mesh IDs).
@@ -28,6 +35,9 @@ WHITE = (255, 255, 255)
 # Glasses frames are wider than the distance between the outer eye corners.
 # frame width (px) = eye distance (px) * GLASSES_WIDTH_SCALE
 GLASSES_WIDTH_SCALE = 1.5
+
+# Weight of the newest frame in the displayed frame rate, which keeps it readable.
+FPS_SMOOTHING = 0.1
 
 # Shift from the bridge landmark to the glasses' centre, in glasses-local
 # units (1.0 = frame width). Positive y moves the glasses down the face.
@@ -52,7 +62,7 @@ def draw_debug(frame, left_point, right_point, bridge_point, eye_midpoint,
         f"eye distance: {eye_distance:.1f} px",
         f"tilt: {math.degrees(angle):+.1f} deg",
         f"glasses center: ({glasses_center[0]:.0f}, {glasses_center[1]:.0f})",
-        glasses_status,
+        *glasses_status.split("\n"),
     ]
     if pose is None:
         lines.append("3D pose: not available")
@@ -67,6 +77,37 @@ def draw_debug(frame, left_point, right_point, bridge_point, eye_midpoint,
                     0.5, WHITE, 1, cv2.LINE_AA)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mirror: real-time virtual eyewear try-on.")
+    parser.add_argument("--model", metavar="PATH",
+                        help="start with this generated .glb glasses model (M switches models)")
+    for field in fields(FitAdjustment):
+        parser.add_argument(f"--fit-{field.name}", type=float, default=field.default,
+                            help="starting fit, as printed by the F key (default: %(default)s)")
+    args = parser.parse_args()
+    fit = FitAdjustment(**{field.name: getattr(args, f"fit_{field.name}")
+                           for field in fields(FitAdjustment)})
+    try:
+        fit.validate()
+    except ValueError as error:
+        parser.error(str(error))
+    return args.model, fit
+
+
+def load_mesh_model(path):
+    """The model at path (None: the default model), or None with a message on failure."""
+    try:
+        return load_glasses_model(path)
+    except ModelLoadError as error:
+        print(f"Could not load the glasses model: {error}\n"
+              "Using the wireframe glasses. Create a model with:\n"
+              "  uv run python image_to_3d/mirror_image_to_3d.py image_to_3d/glasses.jpg "
+              "--complete -o image_to_3d/output/example_3_photo.glb", file=sys.stderr)
+        return None
+
+
+model_path, fit = parse_args()
+
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=False,
@@ -80,22 +121,34 @@ glasses_to_face = attachment_matrix(DEFAULT_GLASSES_ATTACHMENT,
                                     glasses_model.units_to_cm,
                                     glasses_model.orientation)
 head_occluder = load_head_occluder()  # None if the model file is missing
+mesh_model = load_mesh_model(model_path) if model_path else None
+mesh_to_face = fit_matrix(DEFAULT_GLASSES_ATTACHMENT, fit)
 
 camera = cv2.VideoCapture(0)
-show_glasses_2d = True   # G
-show_glasses_3d = False  # H
+# Asking for a model means asking for 3D glasses, even if it then fails to load.
+show_glasses_2d = model_path is None   # G
+show_glasses_3d = model_path is not None  # H
+use_mesh_model = mesh_model is not None  # M: filled model instead of the wireframe
 show_occlusion = True    # O: hide 3D glasses parts that are behind the head
 show_pose_axes = False  # P
 debug_mode = False    # D
 camera_intrinsics = None
 intrinsics_size = None  # rebuild the camera matrix only if the frame size changes
 required_landmarks = max(LEFT_EYE_OUTER, RIGHT_EYE_OUTER, NOSE_BRIDGE) + 1
+fps = None  # measured over the whole loop, shown in the debug panel
+last_frame_time = None
 
 while True:
     success, frame = camera.read()
 
     if not success:
         break
+
+    now = time.perf_counter()
+    if last_frame_time is not None and now > last_frame_time:
+        latest = 1.0 / (now - last_frame_time)
+        fps = latest if fps is None else fps + FPS_SMOOTHING * (latest - fps)
+    last_frame_time = now
 
     frame = cv2.flip(frame, 1)
     height, width = frame.shape[:2]
@@ -137,12 +190,19 @@ while True:
             depth_buffer = None
             if show_occlusion:
                 depth_buffer = render_depth_buffer(head_occluder, pose, width, height)
-            draw_wireframe(frame, glasses_model, glasses_to_face, pose, depth_buffer)
+            if use_mesh_model:
+                render_mesh(frame, mesh_model, mesh_to_face, pose, depth_buffer)
+            else:
+                draw_wireframe(frame, glasses_model, glasses_to_face, pose, depth_buffer)
 
         if debug_mode and eye_distance > 0:
             status = (f"2D glasses [G]: {'on' if show_glasses_2d else 'off'}  "
                       f"3D glasses [H]: {'on' if show_glasses_3d else 'off'}  "
-                      f"occlusion [O]: {'on' if show_occlusion else 'off'}")
+                      f"occlusion [O]: {'on' if show_occlusion else 'off'}\n"
+                      f"model [M]: {mesh_model.name if use_mesh_model else 'wireframe'}  "
+                      f"{width}x{height}  "
+                      f"{'measuring fps' if fps is None else f'{fps:.0f} fps'}\n"
+                      f"fit: {fit_flags(fit) or 'default'}")
             draw_debug(frame, left_point, right_point, bridge_point,
                        eye_midpoint, eye_distance, angle, glasses_center, pose, status)
 
@@ -164,6 +224,18 @@ while True:
         show_occlusion = not show_occlusion
     if key in (ord("p"), ord("P")):
         show_pose_axes = not show_pose_axes
+    if key in (ord("m"), ord("M")):
+        want_mesh = not (show_glasses_3d and use_mesh_model)
+        show_glasses_3d = True
+        if want_mesh and mesh_model is None:
+            mesh_model = load_mesh_model(None)
+        use_mesh_model = want_mesh and mesh_model is not None
+    if key in (ord("f"), ord("F")):
+        print(f"Current fit: {fit_flags(fit) or 'default (no flags needed)'}")
+    new_fit = apply_fit_key(fit, key)
+    if new_fit is not None:
+        fit = new_fit
+        mesh_to_face = fit_matrix(DEFAULT_GLASSES_ATTACHMENT, fit)
 
 camera.release()
 cv2.destroyAllWindows()

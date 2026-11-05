@@ -16,6 +16,7 @@ Built in Python with **OpenCV**, **MediaPipe**, and **NumPy**. The 3D math, proj
 - **Glasses that follow the head** through yaw, pitch, roll, and movement toward or away from the camera.
 - **Perspective-correct 3D rendering** of a wireframe glasses model, with the arms receding toward the ears as you would expect.
 - **Procedurally generated glasses geometry**: rounded lenses that wrap slightly around the face, a bridge, and temple arms that splay outward and bend down at the ear, all built from configurable real-world dimensions in centimetres.
+- **Generated 3D glasses on your face**: load a `.glb` from `image_to_3d` and see filled, shaded glasses with depth testing, using the same tracking and transforms as the wireframe. Fit can be adjusted while running.
 - **Face-aware occlusion**: a depth buffer of the head is rasterized every frame, so the temple arms disappear behind the side of the head when you turn.
 - **Modular accessory system**: the face tracking pipeline is separate from the accessory, so a different model only needs its own geometry and attachment calibration.
 - **Debug and visualization tools**: on-screen readouts of yaw, pitch, roll, and translation, a face-aligned 3D axis overlay, and toggles for each rendering stage.
@@ -96,6 +97,8 @@ When you turn your head, the arm on the far side should disappear behind it. Mir
 
 The rasterizer is written in NumPy and processes all triangles at once instead of looping in Python.
 
+Generated models use the same head depth buffer, tested per pixel rather than per sample. See [Live 3D Try-On](#live-3d-try-on).
+
 ## Architecture
 
 ```
@@ -107,8 +110,11 @@ Mirror/
 ├── accessory_transform.py   # Attachment matrices and 3D -> pixel projection for any accessory
 ├── glasses_3d.py            # Procedural 3D glasses model and wireframe renderer
 ├── occlusion.py             # Head proxy mesh, depth-buffer rasterizer, visibility tests
+├── glb_model.py             # Load and cache generated .glb glasses for rendering
+├── mesh_renderer.py         # Filled, shaded triangle renderer with depth and near-plane clipping
+├── fit_controls.py          # Live fit adjustments: scale, position, rotation
 ├── face_landmarker.task     # MediaPipe model bundle (source of the canonical face mesh)
-├── image_to_3d/             # Standalone: glasses image -> approximate 3D .glb (not used by main.py yet)
+├── image_to_3d/             # Standalone: glasses image -> approximate 3D .glb (imports nothing from the app)
 ├── tests/                   # Unit and integration tests
 ├── pyproject.toml
 └── uv.lock
@@ -123,7 +129,8 @@ The modules are layered so each stage can change on its own:
 | Geometry | `geometry.py` |
 | Head pose | `head_pose.py` |
 | Accessory transformations | `accessory_transform.py` |
-| Glasses rendering | `glasses_3d.py` (3D), `glasses.py` (2D) |
+| Glasses rendering | `mesh_renderer.py` (generated model), `glasses_3d.py` (wireframe), `glasses.py` (2D) |
+| Model loading and fit | `glb_model.py`, `fit_controls.py` |
 | Occlusion | `occlusion.py` |
 | Testing | `tests/` |
 
@@ -145,6 +152,52 @@ A window titled **Mirror** opens with the camera feed. The app starts with the 2
 **Camera permissions:** on macOS, the first run asks for camera access for your terminal or IDE. If the window never appears, enable it under *System Settings → Privacy & Security → Camera* and run the app again. Mirror opens the default camera (index 0).
 
 **To exit,** press **Q** with the Mirror window focused.
+
+To try on a generated model, see [Live 3D Try-On](#live-3d-try-on).
+
+## Live 3D Try-On
+
+Generate a model once, then start Mirror with it:
+
+```bash
+uv run python image_to_3d/mirror_image_to_3d.py image_to_3d/glasses.jpg --complete -o image_to_3d/output/example_3_photo.glb
+uv run python main.py --model image_to_3d/output/example_3_photo.glb
+```
+
+**M** switches between the generated model and the wireframe. Without `--model`, the app starts as usual and **M** loads `image_to_3d/output/example_3_photo.glb`. A missing or invalid file prints the reason and falls back to the wireframe.
+
+### Adjusting the fit
+
+Fit keys work while the app runs and never change the model's mesh. Press **F** to print the flags that reproduce the current fit, such as `--fit-scale 1.05 --fit-y -0.3`, and pass them next time. **D** shows the fit, the frame size, and the measured frame rate.
+
+| Keys | Adjustment | Step | Limit |
+|---|---|---|---|
+| `J` / `L` | Left / right | 1 mm | ±5 cm |
+| `I` / `K` | Up / down | 1 mm | ±5 cm |
+| `U` / `N` | Forward / back | 1 mm | ±5 cm |
+| `+` / `-` | Larger / smaller | 1% | 50% to 200% |
+| `[` / `]` | Yaw | 1° | ±30° |
+| `;` / `'` | Pitch | 1° | ±30° |
+| `,` / `.` | Roll | 1° | ±30° |
+| `R` | Reset the fit | | |
+
+### How it renders
+
+`glb_model.py` reads each named part (front frame, temples, hinges, nose pads) with its material, and converts metres to centimetres. A file is parsed once, and its per-face render arrays are built once, while loading.
+
+Each frame, `mesh_renderer.py` moves the model through the same matrices as the wireframe, clips triangles at the near plane, culls those facing away, and rasterizes the rest with the rasterizer from `occlusion.py`. It then discards pixels behind the head, shades only the pixels that remain, softens the edges, and blends the result into the frame. A model wider than 420 pixels on screen is rasterized at that width and scaled up, which keeps the cost steady at any frame size or distance, at the price of slightly softer glasses.
+
+### Performance
+
+Measured on the development Mac under a heavy background load (load average 5 to 7), so these are pessimistic. Run on `example_3_photo.glb` (3,008 triangles) with a synthetic moving head, not a webcam. Times are medians in milliseconds, with the face 45 cm from the camera.
+
+| Frame size | Head depth buffer | Mesh render | Wireframe | Whole loop with real MediaPipe |
+|---|---|---|---|---|
+| 640×480 | 8 | 14 | 2 | 34 (30 fps) |
+| 1280×720 | 8 | 29 | 2 | 57 (18 fps) |
+| 1920×1080 | 9 | 35 | 2 | 67 (15 fps) |
+
+A face at 25 cm costs more: 51, 54 and 79 ms for depth buffer plus mesh. Loading the file takes about 40 ms once, and later loads reuse the cached model.
 
 ## Image to 3D
 
@@ -228,14 +281,7 @@ Models use the accessory-local axes from `glasses_3d.py` and `head_pose.py`. Con
 - **X:** towards the screen-right lens. **Y:** up. **Z:** forward, away from the face, so the temples run towards -Z
 - **Units:** centimetres in memory, metres in the GLB, as glTF specifies
 
-Nothing in the live app uses these files yet. A future loader would read the GLB with Trimesh and use the existing transforms unchanged:
-
-```python
-attach = attachment_matrix(DEFAULT_GLASSES_ATTACHMENT, units_to_cm=100.0)
-pixels = project_accessory(vertices_in_metres, attach, pose)
-```
-
-The tests already run exported geometry through `attachment_matrix`, `transform_points`, and `projected_segments`. To display it, the app would also need either a wireframe built from the mesh edges or a triangle renderer. The attachment offset was calibrated for the procedural wireframe, so photo-based frames may need their own.
+The live app loads these files with `glb_model.py` and places them with the existing transforms. See [Live 3D Try-On](#live-3d-try-on). The default attachment offset was calibrated for the procedural wireframe, so a particular frame may need a fit adjustment.
 
 ### Modules
 
@@ -268,11 +314,14 @@ The tests already run exported geometry through `attachment_matrix`, `transform_
 
 | Key | Action | Default |
 |---|---|---|
-| `H` | Toggle 3D wireframe glasses | Off |
-| `G` | Toggle 2D glasses overlay | On |
+| `H` | Toggle 3D glasses | Off (on with `--model`) |
+| `M` | Switch 3D glasses between the generated model and the wireframe | Wireframe (model with `--model`) |
+| `G` | Toggle 2D glasses overlay | On (off with `--model`) |
 | `O` | Toggle occlusion of 3D glasses behind the head | On |
 | `P` | Toggle 3D face axes (X red, Y green, Z blue) | Off |
 | `D` | Toggle debug panel (landmarks, tilt, yaw/pitch/roll, translation) | Off |
+| `F` | Print the current fit as command line flags | |
+| `J` `L` `I` `K` `U` `N` `+` `-` `[` `]` `;` `'` `,` `.` `R` | Adjust the fit ([details](#adjusting-the-fit)) | |
 | `Q` | Quit | |
 
 ## Testing
@@ -283,12 +332,15 @@ Mirror has unit tests for the math and rendering stages, plus an integration tes
 uv run python -m unittest discover -s tests -v
 ```
 
-Current result: **349 tests, all passing.** They cover:
+Current result: **493 tests, all passing.** They cover:
 
 - 2D geometry and transforms
 - Head-pose recovery from synthetic faces, reprojection-error rejection, and Euler-angle signs
 - Glasses model construction, dimension validation, and projection
 - Depth-buffer rasterization, visibility, and line clipping at occluder edges and the near plane
+- GLB loading: unit conversion, part and material preservation, caching, and invalid files
+- Mesh rendering: projection, rasterization against a test of every pixel, depth order, near-plane clipping, shading, the render width limit, head occlusion at frontal, three-quarter and side angles, and attachment to the face
+- Fit controls and model selection, including fallback to the wireframe
 - Image-to-3D: image loading failures, segmentation, wrap curvature, temples, hinges, nose supports, mesh topology, GLB export and reload, determinism, compatibility with Mirror's transforms, and the command line
 - The full app loop and every keyboard toggle
 
@@ -296,17 +348,20 @@ Current result: **349 tests, all passing.** They cover:
 
 - **Approximate camera calibration.** The focal length is estimated from the frame width, so depth and translation values are approximate.
 - **Generic face model.** Pose is solved against MediaPipe's average face, so fit varies with individual face shape.
-- **Procedural glasses only.** There is one programmatically generated wireframe model; textured or imported models are not supported yet.
+- **Not yet real-time at higher resolutions.** On the measurements above, 640×480 reaches about 30 fps and 1280×720 about 18 fps under load. See [Performance](#performance).
+- **No textures, lenses or transparency.** Generated models draw with one solid colour per part, and alpha is ignored, so lens openings are empty.
+- **One fit for all models.** All models start from the same attachment offset, and a fit isn't saved with the model; pass it with the `--fit-*` flags.
 - **No smoothing.** Pose is estimated independently each frame, so some jitter is visible during movement.
-- **Approximate occlusion.** The head behind the face is a simple proxy with no ears or hair, so occlusion can be off around the ears, at extreme head turns, or with large hairstyles.
+- **Approximate occlusion.** The head behind the face is a simple proxy with no ears or hair, so occlusion can be off around the ears, at extreme head turns, or with large hairstyles. The head depth buffer is also 320 pixels wide, so the line where a temple disappears is slightly blocky at higher resolutions.
 - **Single face, local only.** Tracks one face at a time and runs as a desktop window rather than in a browser.
 
 ## Roadmap
 
 Planned work, not yet implemented:
 
-- Loading `image_to_3d` models in the live app, with per-model calibration
-- Importing external 3D eyewear models (e.g. `.glb` / `.obj`)
+- Saving a calibrated fit with each generated model
+- Faster rendering at 720p and above, and camera resolution selection
+- Importing external 3D eyewear models (`.obj`, and `.glb` files from other tools)
 - More realistic frame materials and lens rendering
 - Tracking stabilization and smoothing
 - A glasses catalog and selection interface

@@ -71,6 +71,17 @@ class DepthBuffer:
 
 
 @dataclass(frozen=True)
+class TriangleBoxes:
+    """Clipped bounding boxes of the triangles to rasterize, one row each."""
+    triangles: np.ndarray  # indices into the arrays the boxes were built from
+    x0: np.ndarray
+    y0: np.ndarray
+    widths: np.ndarray
+    counts: np.ndarray     # candidate pixels in the box
+    areas: np.ndarray      # twice the signed area on screen
+
+
+@dataclass(frozen=True)
 class LineSamples:
     """Points along a line model, sampled once in model space."""
     points: np.ndarray  # (S, 3) model units
@@ -168,45 +179,100 @@ def rasterize_depth(points_xy, depths, triangles, width, height, cull_back_faces
     tri_xy = points_xy[triangles]  # (T, 3, 2)
     tri_z = depths[triangles]      # (T, 3)
 
-    # Bounding box of each triangle, clipped to the buffer.
-    x0 = np.clip(np.ceil(tri_xy[..., 0].min(axis=1)), 0, width).astype(np.int64)
-    x1 = np.clip(np.floor(tri_xy[..., 0].max(axis=1)), -1, width - 1).astype(np.int64)
-    y0 = np.clip(np.ceil(tri_xy[..., 1].min(axis=1)), 0, height).astype(np.int64)
-    y1 = np.clip(np.floor(tri_xy[..., 1].max(axis=1)), -1, height - 1).astype(np.int64)
+    boxes = triangle_boxes(tri_xy, width, height, cull_back_faces)
+    total = int(boxes.counts.sum())
+    if total == 0 or total > MAX_RASTER_SAMPLES:
+        return None if total else depth.reshape(height, width)
+
+    fragments = triangle_fragments(tri_xy, boxes, 0, len(boxes.triangles))
+    if fragments is None:
+        return depth.reshape(height, width)
+    tri, px, py, weights = fragments
+
+    # Perspective-correct depth: interpolate 1/Z, then invert.
+    pixel_z = 1.0 / (weights / tri_z[boxes.triangles[tri]]).sum(axis=1)
+
+    np.minimum.at(depth, py * width + px, pixel_z.astype(np.float32))
+    return depth.reshape(height, width)
+
+
+def triangle_boxes(tri_xy, width, height, cull_back_faces=False):
+    """Clipped pixel bounding boxes of the triangles worth rasterizing.
+
+    Triangles with non-finite corners are skipped.
+    """
+    with np.errstate(invalid="ignore"):
+        # Bounding box of each triangle, clipped to the buffer.
+        x0 = np.clip(np.ceil(tri_xy[..., 0].min(axis=1)), 0, width)
+        x1 = np.clip(np.floor(tri_xy[..., 0].max(axis=1)), -1, width - 1)
+        y0 = np.clip(np.ceil(tri_xy[..., 1].min(axis=1)), 0, height)
+        y1 = np.clip(np.floor(tri_xy[..., 1].max(axis=1)), -1, height - 1)
     a, b, c = tri_xy[:, 0], tri_xy[:, 1], tri_xy[:, 2]
     area = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1])
 
     keep = (x1 >= x0) & (y1 >= y0) & (np.abs(area) > 1e-9)
     if cull_back_faces:
         keep &= area < 0
-    box_w = (x1 - x0 + 1)[keep]
-    counts = box_w * (y1 - y0 + 1)[keep]
-    total = int(counts.sum())
-    if total == 0 or total > MAX_RASTER_SAMPLES:
-        return None if total else depth.reshape(height, width)
+    x0, y0 = x0[keep].astype(np.int64), y0[keep].astype(np.int64)
+    widths = x1[keep].astype(np.int64) - x0 + 1
+    counts = widths * (y1[keep].astype(np.int64) - y0 + 1)
+    return TriangleBoxes(np.flatnonzero(keep), x0, y0, widths, counts, area[keep])
 
-    # One row per (triangle, candidate pixel) pair, all at once.
-    tri = np.repeat(np.flatnonzero(keep), counts)
-    local = np.arange(total) - np.repeat(np.cumsum(counts) - counts, counts)
-    widths = np.repeat(box_w, counts)
-    px = x0[tri] + local % widths
-    py = y0[tri] + local // widths
+
+def triangle_fragments(tri_xy, boxes, start, end):
+    """Every pixel inside boxes[start:end] that is inside its triangle, all at once.
+
+    Returns (positions in boxes, x, y, (K, 3) barycentric weights), or None if
+    no pixel qualifies. Weights are linear in screen space.
+    """
+    indices = np.arange(start, end)
+    heights = boxes.counts[start:end] // boxes.widths[start:end]
+    row_count = int(heights.sum())
+    if row_count == 0:
+        return None
+
+    # One row per (triangle, pixel row): where do the triangle's edges cross it?
+    row_tri = np.repeat(indices, heights)
+    row_y = boxes.y0[row_tri] + np.arange(row_count) - np.repeat(np.cumsum(heights) - heights, heights)
+    begin = tri_xy[boxes.triangles[row_tri]]
+    finish = np.roll(begin, -1, axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (row_y[:, None] - begin[..., 1]) / (finish[..., 1] - begin[..., 1])
+    crossing_x = begin[..., 0] + t * (finish[..., 0] - begin[..., 0])
+    crosses = (t >= 0.0) & (t <= 1.0)  # false for flat edges; their neighbours cover the ends
+    left = np.where(crosses, crossing_x, np.inf).min(axis=1)
+    right = np.where(crosses, crossing_x, -np.inf).max(axis=1)
+
+    # Rounding outwards, so the exact test below makes the final decision.
+    box_x0 = boxes.x0[row_tri]
+    box_x1 = box_x0 + boxes.widths[row_tri] - 1
+    span_x0 = np.clip(np.floor(left), box_x0, box_x1).astype(np.int64)
+    span_x1 = np.clip(np.ceil(right), box_x0, box_x1).astype(np.int64)
+    span_widths = np.where(np.isfinite(left), span_x1 - span_x0 + 1, 0)
+    total = int(span_widths.sum())
+    if total == 0:
+        return None
+
+    # One row per (triangle, candidate pixel) pair.
+    tri = np.repeat(row_tri, span_widths)
+    py = np.repeat(row_y, span_widths)
+    px = (np.repeat(span_x0, span_widths) + np.arange(total)
+          - np.repeat(np.cumsum(span_widths) - span_widths, span_widths))
 
     # Barycentric weights of each pixel within its triangle.
-    ax, ay = a[tri, 0], a[tri, 1]
-    w_b = ((px - ax) * (c[tri, 1] - ay) - (c[tri, 0] - ax) * (py - ay)) / area[tri]
-    w_c = ((b[tri, 0] - ax) * (py - ay) - (px - ax) * (b[tri, 1] - ay)) / area[tri]
+    corners = tri_xy[boxes.triangles[tri]]
+    ax, ay = corners[:, 0, 0], corners[:, 0, 1]
+    bx, by = corners[:, 1, 0], corners[:, 1, 1]
+    cx, cy = corners[:, 2, 0], corners[:, 2, 1]
+    area = boxes.areas[tri]
+    w_b = ((px - ax) * (cy - ay) - (cx - ax) * (py - ay)) / area
+    w_c = ((bx - ax) * (py - ay) - (px - ax) * (by - ay)) / area
     w_a = 1.0 - w_b - w_c
     eps = -1e-7
     inside = (w_a >= eps) & (w_b >= eps) & (w_c >= eps)
-
-    # Perspective-correct depth: interpolate 1/Z, then invert.
-    z = tri_z[tri]
-    inverse_z = w_a / z[:, 0] + w_b / z[:, 1] + w_c / z[:, 2]
-    pixel_z = 1.0 / inverse_z[inside]
-
-    np.minimum.at(depth, (py * width + px)[inside], pixel_z.astype(np.float32))
-    return depth.reshape(height, width)
+    if not inside.any():
+        return None
+    return tri[inside], px[inside], py[inside], np.stack((w_a, w_b, w_c), axis=1)[inside]
 
 
 def render_depth_buffer(occluder, pose, image_width, image_height,

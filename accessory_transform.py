@@ -19,15 +19,12 @@ built once. Only the head pose changes from frame to frame.
 """
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 
-from head_pose import FACE_ORIGIN, NO_DISTORTION
+from head_pose import FACE_ORIGIN
 
 # Points closer than this to the camera plane (or behind it) are not projected.
 MIN_DEPTH_CM = 1.0
-
-ZERO_VECTOR = np.zeros(3)
 
 
 @dataclass(frozen=True)
@@ -83,10 +80,14 @@ def project_camera_points(camera_points, camera_matrix):
     pixels = np.full((len(camera_points), 2), np.nan)
     in_front = camera_points[:, 2] >= MIN_DEPTH_CM
     if in_front.any():
-        # The points are already in camera space, so no extra rotation/translation.
-        projected, _ = cv2.projectPoints(camera_points[in_front], ZERO_VECTOR,
-                                         ZERO_VECTOR, camera_matrix, NO_DISTORTION)
-        pixels[in_front] = projected.reshape(-1, 2)
+        # The points are already in camera space and there is no lens distortion,
+        # so this is the pinhole formula alone. Unlike cv2.projectPoints it takes
+        # no Python-to-C conversion, which matters at thousands of points a frame.
+        visible = camera_points[in_front]
+        pixels[in_front, 0] = (camera_matrix[0, 0] * visible[:, 0] / visible[:, 2]
+                               + camera_matrix[0, 2])
+        pixels[in_front, 1] = (camera_matrix[1, 1] * visible[:, 1] / visible[:, 2]
+                               + camera_matrix[1, 2])
     return pixels
 
 
