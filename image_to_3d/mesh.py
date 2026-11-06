@@ -39,13 +39,33 @@ class FrameDimensions:
                 raise ValueError("frame width and thickness must be positive numbers")
 
 
-def _resample_to_working_size(mask):
-    """Crop the mask to its content and scale it to the working resolution."""
+def _working_crop(mask):
+    """(left, top) of the mask's content, its (width, height), and the working size."""
     ys, xs = np.nonzero(mask)
-    cropped = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
-    height, width = cropped.shape
+    left, top = xs.min(), ys.min()
+    width, height = xs.max() + 1 - left, ys.max() + 1 - top
     scale = WORKING_SIZE_PX / max(height, width)
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return (left, top), (width, height), size
+
+
+def working_to_image(mask):
+    """(scale, offset) per axis: image = scale * working + offset, for mask_to_polygons output.
+
+    Pixel centres are at integer coordinates in both. Working coordinates have a
+    one pixel border, and cv2.resize maps the centre of pixel i to (i + 0.5) / s - 0.5.
+    """
+    (left, top), (width, height), (working_w, working_h) = _working_crop(mask)
+    scale = np.array((width / working_w, height / working_h))
+    # image = origin + (working - 1 + 0.5) * scale - 0.5
+    return scale, np.array((left, top)) - 0.5 * scale - 0.5
+
+
+def _resample_to_working_size(mask):
+    """Crop the mask to its content and scale it to the working resolution."""
+    (left, top), (width, height), size = _working_crop(mask)
+    cropped = mask[top:top + height, left:left + width]
+    scale = WORKING_SIZE_PX / max(height, width)
     if scale < 1:
         # Keep any covered pixel: thin rims must not break, which would merge
         # lens openings into the background.
@@ -104,14 +124,22 @@ def mask_to_polygons(mask):
     return sorted(kept, key=lambda part: part.bounds[0])
 
 
-def scale_polygons_to_cm(polygons, frame_width):
-    """Working-pixel polygons -> centimetres: centred on the origin, Y up."""
+def working_to_cm(polygons, frame_width):
+    """(cm per working pixel, working-pixel centre (x, y)) used by scale_polygons_to_cm.
+
+    cm_x = scale * (x - centre_x) and cm_y = -scale * (y - centre_y).
+    """
     if not polygons:
         raise MeshBuildError("The silhouette has no area to build a mesh from")
     min_x, min_y, max_x, max_y = MultiPolygon(polygons).bounds
-    scale = frame_width / (max_x - min_x)
+    return frame_width / (max_x - min_x), np.array(((min_x + max_x) / 2, (min_y + max_y) / 2))
+
+
+def scale_polygons_to_cm(polygons, frame_width):
+    """Working-pixel polygons -> centimetres: centred on the origin, Y up."""
+    scale, (center_x, center_y) = working_to_cm(polygons, frame_width)
     # Negative Y scale flips image-down to mesh-up.
-    to_cm = [scale, 0, 0, -scale, -scale * (min_x + max_x) / 2, scale * (min_y + max_y) / 2]
+    to_cm = [scale, 0, 0, -scale, -scale * center_x, scale * center_y]
     return [affinity.affine_transform(polygon, to_cm) for polygon in polygons]
 
 

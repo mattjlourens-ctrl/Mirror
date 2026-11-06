@@ -326,30 +326,30 @@ class DepthBufferingTests(unittest.TestCase):
 class NearPlaneClippingTests(unittest.TestCase):
     NEAR = 1.0
 
-    def clip(self, triangle):
+    def clip(self, triangle, values=None):
         corners = np.array([triangle], float)
-        normals = np.tile((0.0, 0.0, -1.0), (1, 3, 1))
-        colors = np.array([(1.0, 2.0, 3.0)])
-        gloss = np.array([0.5])
-        return clip_triangles_to_near_plane(corners, normals, colors, gloss, self.NEAR)
+        values = np.tile((0.0, 0.0, -1.0), (1, 3, 1)) if values is None else np.array([values], float)
+        return clip_triangles_to_near_plane(corners, values, self.NEAR)
 
     def test_triangle_in_front_is_unchanged(self):
-        corners, *_ = self.clip([(0, 0, 5), (1, 0, 5), (0, 1, 5)])
+        corners, _, faces = self.clip([(0, 0, 5), (1, 0, 5), (0, 1, 5)])
         np.testing.assert_array_equal(corners, [[(0, 0, 5), (1, 0, 5), (0, 1, 5)]])
+        np.testing.assert_array_equal(faces, [0])
 
     def test_triangle_behind_is_removed(self):
-        corners, *_ = self.clip([(0, 0, -5), (1, 0, -5), (0, 1, 0.5)])
+        corners, _, faces = self.clip([(0, 0, -5), (1, 0, -5), (0, 1, 0.5)])
         self.assertEqual(len(corners), 0)
+        self.assertEqual(len(faces), 0)
 
     def test_one_corner_in_front_leaves_one_triangle(self):
-        corners, *_ = self.clip([(0, 0, 3), (2, 0, -1), (0, 2, -1)])
+        corners, _, _ = self.clip([(0, 0, 3), (2, 0, -1), (0, 2, -1)])
         self.assertEqual(len(corners), 1)
         self.assertTrue((corners[..., 2] >= self.NEAR - 1e-9).all())
         # (0,0,3) -> (2,0,-1) meets Z = 1 halfway.
         self.assertTrue(np.isclose(corners[0], (1, 0, 1)).all(axis=1).any())
 
     def test_two_corners_in_front_leave_two_triangles(self):
-        corners, *_ = self.clip([(0, 0, 3), (2, 0, 3), (0, 2, -1)])
+        corners, _, _ = self.clip([(0, 0, 3), (2, 0, 3), (0, 2, -1)])
         self.assertEqual(len(corners), 2)
         self.assertTrue((corners[..., 2] >= self.NEAR - 1e-9).all())
 
@@ -359,23 +359,25 @@ class NearPlaneClippingTests(unittest.TestCase):
             with self.subTest(triangle=triangle):
                 original = np.cross(np.subtract(triangle[1], triangle[0]),
                                     np.subtract(triangle[2], triangle[0]))
-                corners, *_ = self.clip(triangle)
+                corners, _, _ = self.clip(triangle)
                 for a, b, c in corners:
                     self.assertGreater(np.cross(b - a, c - a) @ original, 0)
 
-    def test_attributes_stay_with_the_clipped_triangles(self):
-        _, normals, colors, gloss = self.clip([(0, 0, 3), (2, 0, 3), (0, 2, -1)])
-        np.testing.assert_allclose(normals, np.tile((0.0, 0.0, -1.0), (2, 3, 1)))
-        np.testing.assert_array_equal(colors, [(1, 2, 3), (1, 2, 3)])
-        np.testing.assert_array_equal(gloss, [0.5, 0.5])
+    def test_pieces_point_back_to_their_original_face(self):
+        corners = np.array([[(0, 0, 5), (1, 0, 5), (0, 1, 5)],
+                            [(0, 0, 3), (2, 0, 3), (0, 2, -1)],
+                            [(0, 0, -3), (2, 0, -3), (0, 2, -1)],
+                            [(0, 0, 3), (2, 0, -1), (0, 2, -1)]], float)
+        values = np.zeros((4, 3, 1))
+        _, _, faces = clip_triangles_to_near_plane(corners, values, self.NEAR)
+        self.assertEqual(sorted(faces.tolist()), [0, 1, 1, 3])
 
-    def test_normals_interpolate_along_cut_edges(self):
-        corners = np.array([[(0, 0, 3), (2, 0, -1), (0, 2, 3)]], float)
-        normals = np.array([[(1, 0, 0), (0, 1, 0), (1, 0, 0)]], float)
-        clipped, new_normals, *_ = clip_triangles_to_near_plane(
-            corners, normals, np.zeros((1, 3)), np.zeros(1), self.NEAR)
+    def test_corner_values_interpolate_along_cut_edges(self):
+        # Normals and texture coordinates alike: (nx, ny, nz, u, v).
+        values = [(1, 0, 0, 0.0, 0.0), (0, 1, 0, 1.0, 0.0), (1, 0, 0, 0.0, 1.0)]
+        clipped, new_values, _ = self.clip([(0, 0, 3), (2, 0, -1), (0, 2, 3)], values)
         at_cut = np.isclose(clipped, (1, 0, 1)).all(axis=2)
-        np.testing.assert_allclose(new_normals[at_cut][0], (0.5, 0.5, 0))
+        np.testing.assert_allclose(new_values[at_cut][0], (0.5, 0.5, 0, 0.5, 0.0))
 
     def test_triangle_crossing_the_camera_renders_only_its_front_part(self):
         vertices = np.array([(-3, 3, 10), (3, 3, 10), (0, 5, -10)], float)
@@ -385,6 +387,140 @@ class NearPlaneClippingTests(unittest.TestCase):
         self.assertTrue(changed(frame).any())
         # Unclipped, the corner behind the camera would mirror across the image.
         self.assertEqual(changed(frame)[:100].sum(), 0)
+
+
+def textured_quad(x_range, y_range, z_values, texture, name="tex", uv_box=((0, 0), (1, 1))):
+    """Quad facing the camera, textured with u along X and v up the image (towards -Y).
+
+    z_values -- Z at the four corners: (x0, y0), (x1, y0), (x1, y1), (x0, y1)
+    """
+    (x0, x1), (y0, y1) = x_range, y_range
+    vertices = np.array([(x0, y0, z_values[0]), (x1, y0, z_values[1]),
+                         (x1, y1, z_values[2]), (x0, y1, z_values[3])], float)
+    (u0, v0), (u1, v1) = uv_box
+    # Camera Y points down, so the top of the image (v1) goes at y0.
+    uvs = np.array([(u0, v1), (u1, v1), (u1, v0), (u0, v0)], float)
+    return MeshPart(name, vertices, np.array([(0, 2, 1), (0, 3, 2)]), (255, 255, 255), 0.0,
+                    uvs=uvs, texture=texture)
+
+
+def quadrant_texture(size=64):
+    """Top-left red, top-right green, bottom-left blue, bottom-right yellow (BGR)."""
+    texture = np.zeros((size, size, 3), np.uint8)
+    half = size // 2
+    texture[:half, :half] = (0, 0, 230)
+    texture[:half, half:] = (0, 230, 0)
+    texture[half:, :half] = (230, 0, 0)
+    texture[half:, half:] = (0, 230, 230)
+    return texture
+
+
+def dominant(pixel):
+    b, g, r = (int(value) for value in pixel)
+    if r > 120 and g > 120 and b < 80:
+        return "yellow"
+    return ("blue", "green", "red")[int(np.argmax((b, g, r)))]
+
+
+class TextureTests(unittest.TestCase):
+    def test_texture_lands_the_right_way_up_and_round(self):
+        frame, drawn = render(model_of(textured_quad((-5, 5), (-5, 5), (50,) * 4, quadrant_texture())))
+        self.assertTrue(drawn)
+        self.assertEqual(dominant(frame[240 - 30, 320 - 30]), "red")
+        self.assertEqual(dominant(frame[240 - 30, 320 + 30]), "green")
+        self.assertEqual(dominant(frame[240 + 30, 320 - 30]), "blue")
+        self.assertEqual(dominant(frame[240 + 30, 320 + 30]), "yellow")
+
+    def test_photo_colours_survive_the_lighting_when_facing_the_camera(self):
+        texture = np.full((8, 8, 3), (60, 120, 180), np.uint8)
+        frame, _ = render(model_of(textured_quad((-5, 5), (-5, 5), (50,) * 4, texture)))
+        np.testing.assert_allclose(frame[240, 320].astype(int), (60, 120, 180), atol=8)
+
+    def test_material_colour_tints_the_texture_as_in_gltf(self):
+        texture = np.full((8, 8, 3), (60, 120, 180), np.uint8)
+        part = textured_quad((-5, 5), (-5, 5), (50,) * 4, texture)
+        tinted = MeshPart(part.name, part.vertices, part.faces, (128, 128, 128), 0.0,
+                          uvs=part.uvs, texture=part.texture)
+        plain, _ = render(model_of(part))
+        half, _ = render(model_of(tinted))
+        np.testing.assert_allclose(half[240, 320].astype(int), plain[240, 320] / 2, atol=3)
+
+    def test_texture_interpolation_is_perspective_correct(self):
+        # Left edge at Z = 40, right edge at Z = 80. The texture's middle is at X = 0,
+        # Z = 60, which projects to the image centre. Affine interpolation would put it
+        # at x = 300, halfway between the edges on screen (240 and 360).
+        texture = np.zeros((4, 64, 3), np.uint8)
+        texture[:, :32] = (0, 0, 230)
+        texture[:, 32:] = (0, 230, 0)
+        quad_part = textured_quad((-5, 5), (-5, 5), (40, 80, 80, 40), texture)
+        frame, _ = render(model_of(quad_part))
+        row = frame[240].astype(int)
+        boundary = np.flatnonzero(row[:, 1] > row[:, 2]).min()
+        self.assertAlmostEqual(boundary, 320, delta=2)
+
+    def test_near_plane_clipping_keeps_the_texture_in_place(self):
+        # The quad's top runs behind the camera (Z = 4Y + 5, so Z < 1 above Y = -1); the
+        # colour boundary must stay at X = 0, which projects to x = 320 on every row.
+        texture = np.zeros((4, 64, 3), np.uint8)
+        texture[:, :32] = (0, 0, 230)
+        texture[:, 32:] = (0, 230, 0)
+        quad_part = textured_quad((-5, 5), (-5, 5), (-15, -15, 25, 25), texture)
+        frame, drawn = render(model_of(quad_part))
+        self.assertTrue(drawn)
+        for y in (60, 200, 360):
+            row = frame[y].astype(int)
+            boundary = np.flatnonzero(row[:, 1] > row[:, 2]).min()
+            self.assertAlmostEqual(boundary, 320, delta=2, msg=f"row {y}")
+
+    def test_fine_detail_far_away_averages_instead_of_sparkling(self):
+        texture = np.zeros((256, 256, 3), np.uint8)
+        texture[(np.arange(256)[:, None] + np.arange(256)[None, :]) % 2 == 0] = 255
+        # At Z = 90 the quad is 71 px across, about 3.6 texels per pixel. Sampling only
+        # the full-size texture measured a standard deviation of 16.8 here; some other
+        # distances put every sample between squares, which hides the difference.
+        frame, _ = render(model_of(textured_quad((-5, 5), (-5, 5), (90,) * 4, texture)))
+        inside = frame[240 - 20:240 + 20, 320 - 20:320 + 20, 1].astype(int)
+        self.assertLess(inside.std(), 6)
+        self.assertAlmostEqual(inside.mean(), 125, delta=15)
+
+    def test_levels_blend_so_detail_fades_without_a_jump(self):
+        from glb_model import _pyramid
+        texture = _pyramid(quadrant_texture(64))
+        uvs = np.array([(0.49, 0.75), (0.2, 0.3), (0.51, 0.24)])
+        finer = mesh_renderer._sample_texture(texture, uvs, 1.0)
+        coarser = mesh_renderer._sample_texture(texture, uvs, 2.0)
+        self.assertGreater(np.abs(finer - coarser).max(), 5)  # the levels really differ here
+        np.testing.assert_allclose(mesh_renderer._sample_texture(texture, uvs, 1.5),
+                                   (finer + coarser) / 2, atol=1e-3)
+
+    def test_texture_detail_is_kept_up_close(self):
+        frame, _ = render(model_of(textured_quad((-5, 5), (-5, 5), (50,) * 4, quadrant_texture())))
+        # Sharp quadrant boundary: a few pixels from red to green.
+        row = frame[240 - 30, 320 - 6:320 + 6].astype(int)
+        self.assertEqual(dominant(row[0]), "red")
+        self.assertEqual(dominant(row[-1]), "green")
+
+    def test_textured_surfaces_are_depth_tested(self):
+        near = textured_quad((-5, 5), (-5, 5), (40,) * 4, quadrant_texture(), "near")
+        far = quad((-5, 5), (-5, 5), 60, (128, 0, 128), name="far")
+        for parts in ((near, far), (far, near)):
+            frame, _ = render(model_of(*parts))
+            self.assertEqual(dominant(frame[240 - 30, 320 - 30]), "red")
+
+    def test_textured_surfaces_are_hidden_by_the_head(self):
+        depth = np.full((HEIGHT, WIDTH), np.inf, np.float32)
+        depth[:, :320] = 40
+        part = textured_quad((-5, 5), (-5, 5), (50,) * 4, quadrant_texture())
+        frame, _ = render(model_of(part), depth_buffer=DepthBuffer(depth, 1.0))
+        self.assertFalse(changed(frame)[240 - 30, 300])
+        self.assertEqual(dominant(frame[240 - 30, 320 + 30]), "green")
+
+    def test_textured_and_plain_parts_together(self):
+        textured = textured_quad((-12, -2), (-5, 5), (50,) * 4, quadrant_texture(), "tex")
+        plain = quad((2, 12), (-5, 5), 50, (200, 0, 0), name="plain")
+        frame, _ = render(model_of(textured, plain))
+        self.assertEqual(dominant(frame[240 - 30, 320 - 130]), "red")
+        self.assertEqual(dominant(frame[240, 320 + 90]), "blue")
 
 
 class ShadingTests(unittest.TestCase):

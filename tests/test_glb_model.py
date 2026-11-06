@@ -12,6 +12,7 @@ from glb_model import (MeshModel, MeshPart, ModelLoadError, load_glasses_model)
 from image_to_3d.assembly import (FRONT_FRAME, LEFT_HINGE, LEFT_TEMPLE, RIGHT_HINGE, RIGHT_TEMPLE,
                                   GlassesParameters, assemble_glasses, export_model_glb)
 from image_to_3d.demo import make_demo_image
+from image_to_3d.assembly import assemble_glasses
 from image_to_3d.mesh import mask_to_polygons
 from image_to_3d.segmentation import segment_glasses
 from tests.test_head_pose import FRONTAL_ROTATION, make_pose
@@ -197,6 +198,75 @@ class InvalidFileTests(TempDirTestCase):
         self.assertGreater(len(load_glasses_model(path).part_names), 0)
 
 
+class TexturedModelTests(TempDirTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from image_to_3d.appearance import extract_appearance
+        from tests.test_appearance import YELLOW, frame_image
+        image = frame_image(ends=YELLOW)
+        mask = segment_glasses(image)
+        polygons = mask_to_polygons(mask)
+        cls.appearance = extract_appearance(image, mask, polygons, 14.0)
+        cls.source = assemble_glasses(polygons)
+
+    def load(self):
+        path = export_model_glb(self.source, self.dir / "textured.glb", self.appearance)
+        return load_glasses_model(path)
+
+    def test_front_frame_brings_its_texture_as_bgr(self):
+        front = self.load().part(FRONT_FRAME)
+        np.testing.assert_array_equal(front.texture, self.appearance.texture[..., ::-1])
+        self.assertEqual(front.uvs.shape, (len(front.vertices), 2))
+
+    def test_other_parts_have_colours_only(self):
+        temple = self.load().part(LEFT_TEMPLE)
+        self.assertIsNone(temple.texture)
+        self.assertIsNone(temple.uvs)
+        self.assertEqual(temple.color_bgr, tuple(self.appearance.temple_color[::-1]))
+
+    def test_texture_factor_is_white_so_the_photo_is_unchanged(self):
+        self.assertEqual(self.load().part(FRONT_FRAME).color_bgr, (255, 255, 255))
+
+    def test_texture_without_a_colour_factor_is_shown_unchanged(self):
+        from PIL import Image
+        path = self.dir / "bare.glb"
+        mesh = trimesh.creation.box((0.1, 0.1, 0.1))
+        material = trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.fromarray(np.full((4, 4, 3), 90, np.uint8)))
+        mesh.visual = trimesh.visual.TextureVisuals(uv=np.zeros((len(mesh.vertices), 2)),
+                                                    material=material)
+        path.write_bytes(trimesh.Scene({"box": mesh}).export(file_type="glb"))
+        self.assertEqual(load_glasses_model(path).part("box").color_bgr, (255, 255, 255))
+
+    def test_roughness_becomes_gloss(self):
+        expected = 1.0 - self.appearance.settings.frame_roughness
+        self.assertAlmostEqual(self.load().part(FRONT_FRAME).gloss, expected, places=5)
+
+    def test_render_data_carries_uvs_and_texture_ids(self):
+        model = self.load()
+        data = model.render_data
+        front_faces = len(model.part(FRONT_FRAME).faces)
+        self.assertEqual(data.uvs.shape, (len(data.corners), 3, 2))
+        # Parts can come back in any order, so count rather than slice.
+        self.assertEqual((data.texture_ids == 0).sum(), front_faces)
+        self.assertEqual((data.texture_ids == -1).sum(), len(data.corners) - front_faces)
+        self.assertEqual(len(data.textures), 1)
+
+    def test_texture_pyramid_halves_each_level(self):
+        texture = self.load().render_data.textures[0]
+        self.assertGreater(len(texture.levels), 3)
+        for finer, coarser in zip(texture.levels, texture.levels[1:]):
+            self.assertEqual(coarser.shape[0], (finer.shape[0] + 1) // 2)
+
+    def test_geometry_is_unchanged_by_texturing(self):
+        textured = self.load()
+        plain = load_glasses_model(export_model_glb(self.source, self.dir / "plain.glb"))
+        for name in plain.part_names:
+            np.testing.assert_allclose(textured.part(name).vertices.min(axis=0),
+                                       plain.part(name).vertices.min(axis=0), atol=1e-4)
+            self.assertEqual(len(textured.part(name).faces), len(plain.part(name).faces))
+
+
 class MeshPartValidationTests(unittest.TestCase):
     TRIANGLE = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0)], float)
 
@@ -209,6 +279,19 @@ class MeshPartValidationTests(unittest.TestCase):
     def test_out_of_range_faces_rejected(self):
         with self.assertRaises(ModelLoadError):
             MeshModel("m", (MeshPart("p", self.TRIANGLE, np.array([[0, 1, 9]])),))
+
+    def test_uvs_must_match_the_vertices(self):
+        texture = np.zeros((4, 4, 3), np.uint8)
+        for uvs in (np.zeros((2, 2)), np.full((3, 2), np.nan), np.zeros((3, 3))):
+            with self.subTest(shape=uvs.shape):
+                with self.assertRaises(ModelLoadError):
+                    MeshModel("m", (MeshPart("p", self.TRIANGLE, np.array([[0, 1, 2]]),
+                                             uvs=uvs, texture=texture),))
+
+    def test_uvs_and_texture_come_together(self):
+        with self.assertRaises(ModelLoadError):
+            MeshModel("m", (MeshPart("p", self.TRIANGLE, np.array([[0, 1, 2]]),
+                                     uvs=np.zeros((3, 2))),))
 
     def test_no_parts_rejected(self):
         with self.assertRaises(ModelLoadError):

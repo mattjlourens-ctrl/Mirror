@@ -5,9 +5,10 @@
     uv run python image_to_3d/mirror_image_to_3d.py --demo --complete
 
 By default this writes the shallow front frame alone. --complete adds a curved
-front, temples and hinges. Only the front outline comes from the image; everything
-else is estimated from parameters, so the result is an approximation and not a
-physically accurate reconstruction of the glasses.
+front, temples and hinges, and textures the front with the photo. Only the front
+outline and front appearance come from the image; everything else is estimated
+from parameters, so the result is an approximation and not a physically accurate
+reconstruction of the glasses.
 """
 import argparse
 from dataclasses import replace
@@ -17,6 +18,7 @@ import sys
 if __package__ in (None, ""):  # run by path: make the package importable
     sys.path[0] = str(Path(__file__).resolve().parent.parent)
 
+from image_to_3d.appearance import MaterialSettings
 from image_to_3d.assembly import GlassesParameters
 from image_to_3d.demo import write_demo_image
 from image_to_3d.errors import ImageToMeshError
@@ -48,6 +50,14 @@ def _add_complete_options(parser):
                        help="how far the outer edges sit behind the centre, in cm "
                             f"(default: {GlassesParameters.frame_curvature})")
     group.add_argument("--nose-pads", action="store_true", help="add separate nose pads")
+    group.add_argument("--no-texture", action="store_true",
+                       help="skip the photo texture and estimated colours; use fixed materials")
+    group.add_argument("--hinge-material", choices=("match", "metal"),
+                       help="hinges match the frame colour, or are grey metal "
+                            f"(default: {MaterialSettings.hinge_material})")
+    group.add_argument("--frame-roughness", type=float,
+                       help="0 for glossy, 1 for matte; a setting, not measured from the photo "
+                            f"(default: {MaterialSettings.frame_roughness})")
     group.add_argument("--opening-cleanup", type=float,
                        help="remove strips narrower than this fraction of the frame width from "
                             "lens openings, such as temples seen through a lens; 0 disables "
@@ -64,9 +74,11 @@ def _add_complete_options(parser):
 def _complete_only_flags(args):
     """Options given that only mean something with --complete."""
     flags = [f"--{name.replace('_', '-')}" for name, value in vars(args).items()
-             if value is not None and (name in ("frame_curvature", "opening_cleanup")
+             if value is not None and (name in ("frame_curvature", "opening_cleanup",
+                                                "hinge_material", "frame_roughness")
                                        or "temple_" in name)]
-    return flags + (["--nose-pads"] if args.nose_pads else [])
+    return (flags + (["--nose-pads"] if args.nose_pads else [])
+            + (["--no-texture"] if args.no_texture else []))
 
 
 def parse_args(argv):
@@ -96,7 +108,16 @@ def parse_args(argv):
         parser.error("give either an image or --demo")
     if not args.complete and (flags := _complete_only_flags(args)):
         parser.error(f"{', '.join(flags)} only apply with --complete")
+    if args.no_texture and (args.hinge_material or args.frame_roughness is not None):
+        parser.error("--hinge-material and --frame-roughness need the texture; drop --no-texture")
     return args
+
+
+def _material_settings(args):
+    overrides = {name: value for name, value in (("hinge_material", args.hinge_material),
+                                                 ("frame_roughness", args.frame_roughness))
+                 if value is not None}
+    return replace(MaterialSettings(), **overrides)
 
 
 def _temple_parameters(args, side):
@@ -134,15 +155,23 @@ def _run_complete(args, source, output):
                                       adaptive_white=adaptive)
     cleanup = DEFAULT_OPENING_CLEANUP if args.opening_cleanup is None else args.opening_cleanup
     result = convert_image_to_glasses(source, output, _glasses_parameters(args), segmentation,
-                                      cleanup)
+                                      cleanup, texture=not args.no_texture,
+                                      materials=_material_settings(args))
 
     model = result.model
     print(f"Wrote {result.output_path} ({result.output_path.stat().st_size} bytes)")
     for component in model.report.components:
         print(f"  {component.name}: {component.vertices} vertices, {component.faces} faces")
     print(f"  validation passed; openings: {model.openings}, nose support: {model.nose_support}")
-    print("  The front outline comes from the image. Depth, temples, hinges and nose pads are "
-          "estimated, not reconstructed.")
+    appearance = result.appearance
+    if appearance is None:
+        print("  untextured: fixed default materials")
+    else:
+        height, width = appearance.texture.shape[:2]
+        print(f"  texture: {width}x{height} px from the photo, embedded; "
+              f"frame colour RGB{appearance.frame_color}, temples RGB{appearance.temple_color}")
+    print("  The front outline and appearance come from the image. Depth, temples, hinges, "
+          "nose pads and the colours of unseen surfaces are estimated, not reconstructed.")
     _warn_if_no_openings(model.openings)
 
 

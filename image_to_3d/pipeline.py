@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from image_to_3d.appearance import FrameAppearance, MaterialSettings, extract_appearance
 from image_to_3d.assembly import GlassesModel, GlassesParameters, assemble_glasses, export_model_glb
 from image_to_3d.mesh import FrameDimensions, export_glb, mask_to_polygons, polygons_to_mesh
 from image_to_3d.segmentation import (SegmentationConfig, load_image, remove_opening_intrusions,
@@ -39,15 +40,25 @@ class GlassesConversionResult:
     model: GlassesModel
     mask: np.ndarray  # the cleaned silhouette the frame was traced from
     output_path: Path
+    appearance: FrameAppearance = None  # None when texturing was turned off
 
 
 def convert_image_to_glasses(source, output, params=GlassesParameters(),
                              segmentation=SegmentationConfig(adaptive_white=True),
-                             opening_cleanup=DEFAULT_OPENING_CLEANUP):
-    """Convert a glasses image to a complete model; writes nothing on failure."""
+                             opening_cleanup=DEFAULT_OPENING_CLEANUP, texture=True,
+                             materials=MaterialSettings()):
+    """Convert a glasses image to a complete model; writes nothing on failure.
+
+    texture -- give the front the photo's appearance and the other parts colours
+               estimated from it; False keeps the fixed default materials
+    """
     params.validate()
-    mask = remove_opening_intrusions(segment_glasses(load_image(source), segmentation),
-                                     opening_cleanup)
-    model = assemble_glasses(mask_to_polygons(mask), params)
-    return GlassesConversionResult(model=model, mask=mask,
-                                   output_path=export_model_glb(model, output))
+    materials.validate()
+    image = load_image(source)
+    mask = remove_opening_intrusions(segment_glasses(image, segmentation), opening_cleanup)
+    polygons = mask_to_polygons(mask)
+    model = assemble_glasses(polygons, params)
+    appearance = (extract_appearance(image, mask, polygons, params.frame_width, materials)
+                  if texture else None)
+    return GlassesConversionResult(model=model, mask=mask, appearance=appearance,
+                                   output_path=export_model_glb(model, output, appearance))

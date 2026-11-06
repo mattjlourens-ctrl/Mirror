@@ -9,6 +9,7 @@ dependencies = [
     "mediapipe==0.10.21",
     "numpy<2",
     "opencv-python>=4.8,<5",
+    "pillow>=10",
     "shapely>=2.2.0",
     "trimesh>=5.2.0",
 ]

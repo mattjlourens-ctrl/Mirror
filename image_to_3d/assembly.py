@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
+from image_to_3d.appearance import textured_frame_mesh
 from image_to_3d.curvature import build_curved_frame
 from image_to_3d.errors import MeshBuildError
 from image_to_3d.hinges import (HingeParameters, build_fallback_bridge, build_hinge,
@@ -45,6 +46,10 @@ PAD_MATERIAL = dict(baseColorFactor=(225, 225, 215, 255), metallicFactor=0.0, ro
 MATERIALS = {FRONT_FRAME: FRAME_MATERIAL, LEFT_TEMPLE: FRAME_MATERIAL, RIGHT_TEMPLE: FRAME_MATERIAL,
              BRIDGE: FRAME_MATERIAL, LEFT_HINGE: METAL_MATERIAL, RIGHT_HINGE: METAL_MATERIAL,
              LEFT_NOSE_PAD: PAD_MATERIAL, RIGHT_NOSE_PAD: PAD_MATERIAL}
+# Which of FrameAppearance.materials() each component takes.
+MATERIAL_ROLES = {FRONT_FRAME: "front", LEFT_TEMPLE: "temple", RIGHT_TEMPLE: "temple",
+                  BRIDGE: "frame", LEFT_HINGE: "hinge", RIGHT_HINGE: "hinge",
+                  LEFT_NOSE_PAD: "pad", RIGHT_NOSE_PAD: "pad"}
 
 
 @dataclass(frozen=True)
@@ -131,18 +136,28 @@ def assemble_glasses(polygons, params=GlassesParameters()):
                         left_pivot=hinges[-1].pivot, right_pivot=hinges[1].pivot)
 
 
-def _export_mesh(name, mesh):
-    """A copy in metres, carrying its material."""
-    metres = mesh.copy()
+def _export_mesh(name, mesh, appearance):
+    """A copy in metres, carrying its material, and the texture for the front frame."""
+    if appearance is not None and name == FRONT_FRAME:
+        metres = textured_frame_mesh(mesh, appearance)
+        metres.visual.material.name = name
+    else:
+        metres = mesh.copy()
+        values = MATERIALS[name] if appearance is None else appearance.materials()[MATERIAL_ROLES[name]]
+        material = trimesh.visual.material.PBRMaterial(name=name, **values)
+        metres.visual = trimesh.visual.TextureVisuals(material=material)
     metres.apply_scale(CM_TO_M)
-    material = trimesh.visual.material.PBRMaterial(name=name, **MATERIALS[name])
-    metres.visual = trimesh.visual.TextureVisuals(material=material)
     return metres
 
 
-def export_model_glb(model, path):
-    """Write one GLB with a named node per component; returns the path written."""
+def export_model_glb(model, path, appearance=None):
+    """Write one GLB with a named node per component; returns the path written.
+
+    With a FrameAppearance, the front frame carries the embedded photo texture and
+    the other parts take colours estimated from it. Without one, every part gets
+    the fixed materials above.
+    """
     scene = trimesh.Scene()
     for name, mesh in model.components.items():
-        scene.add_geometry(_export_mesh(name, mesh), node_name=name, geom_name=name)
+        scene.add_geometry(_export_mesh(name, mesh, appearance), node_name=name, geom_name=name)
     return write_glb(scene, Path(path))

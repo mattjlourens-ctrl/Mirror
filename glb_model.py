@@ -1,7 +1,8 @@
 """Load a generated glasses .glb for the live renderer.
 
 Each mesh node stays a separate named part (front_frame, left_temple, ...) with
-its own material. The glTF axes already match Mirror's accessory axes (X right,
+its own material, and its embedded base colour texture and UVs if it has them.
+The glTF axes already match Mirror's accessory axes (X right,
 Y up, Z forward), so loading only converts metres to centimetres.
 
 Models are static: a file is parsed once, and render_data is built once per
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from pathlib import Path
 
+import cv2
 import numpy as np
 import trimesh
 
@@ -37,8 +39,16 @@ class MeshPart:
     name: str
     vertices: np.ndarray  # (N, 3) cm
     faces: np.ndarray     # (F, 3) vertex indices, counter-clockwise from outside
-    color_bgr: tuple = DEFAULT_COLOR_BGR
+    color_bgr: tuple = DEFAULT_COLOR_BGR  # multiplies the texture, as in glTF
     gloss: float = 0.0    # 0 = matte, 1 = strong highlight
+    uvs: np.ndarray = None      # (N, 2) per vertex; (0, 0) is the texture's bottom-left
+    texture: np.ndarray = None  # (H, W, 3) uint8 BGR
+
+
+@dataclass(frozen=True, eq=False)
+class Texture:
+    """A texture and its successively halved copies, for sampling at any distance."""
+    levels: tuple  # uint8 BGR images, full size first
 
 
 @dataclass(frozen=True, eq=False)
@@ -48,6 +58,9 @@ class RenderData:
     normals: np.ndarray  # (F, 3, 3) unit normal at each corner
     colors: np.ndarray   # (F, 3) BGR
     gloss: np.ndarray    # (F,)
+    uvs: np.ndarray      # (F, 3, 2) texture coordinates per corner; zero if untextured
+    texture_ids: np.ndarray  # (F,) index into textures, or -1
+    textures: tuple      # Texture per textured part
 
 
 @dataclass(frozen=True, eq=False)
@@ -73,15 +86,31 @@ class MeshModel:
 
     @cached_property
     def render_data(self):
-        corners, normals, colors, gloss = [], [], [], []
+        corners, normals, colors, gloss, uvs, texture_ids, textures = [], [], [], [], [], [], []
         for part in self.parts:
             faces = part.faces[_non_degenerate(part)]
             corners.append(part.vertices[faces])
             normals.append(_corner_normals(part.vertices, faces))
             colors.append(np.tile(np.asarray(part.color_bgr, dtype=np.float32), (len(faces), 1)))
             gloss.append(np.full(len(faces), part.gloss, dtype=np.float32))
+            if part.texture is None:
+                uvs.append(np.zeros((len(faces), 3, 2), dtype=np.float32))
+                texture_ids.append(np.full(len(faces), -1, dtype=np.int32))
+            else:
+                uvs.append(part.uvs[faces].astype(np.float32))
+                texture_ids.append(np.full(len(faces), len(textures), dtype=np.int32))
+                textures.append(_pyramid(part.texture))
         return RenderData(np.concatenate(corners), np.concatenate(normals),
-                          np.concatenate(colors), np.concatenate(gloss))
+                          np.concatenate(colors), np.concatenate(gloss), np.concatenate(uvs),
+                          np.concatenate(texture_ids), tuple(textures))
+
+
+def _pyramid(image):
+    """Each level half the size of the one before, smoothed first so detail averages."""
+    levels = [np.ascontiguousarray(image)]
+    while min(levels[-1].shape[:2]) > 1:
+        levels.append(cv2.pyrDown(levels[-1]))
+    return Texture(tuple(levels))
 
 
 def _validate_part(part):
@@ -91,6 +120,13 @@ def _validate_part(part):
         raise ModelLoadError(f"{part.name}: the mesh has non-finite vertices")
     if part.faces.min() < 0 or part.faces.max() >= len(part.vertices):
         raise ModelLoadError(f"{part.name}: a face refers to a missing vertex")
+    if (part.uvs is None) != (part.texture is None):
+        raise ModelLoadError(f"{part.name}: texture coordinates and a texture come together")
+    if part.uvs is not None:
+        if part.uvs.shape != (len(part.vertices), 2) or not np.isfinite(part.uvs).all():
+            raise ModelLoadError(f"{part.name}: texture coordinates don't match the vertices")
+        if part.texture.ndim != 3 or part.texture.shape[2] != 3 or part.texture.dtype != np.uint8:
+            raise ModelLoadError(f"{part.name}: the texture is not an 8-bit colour image")
 
 
 def _face_normals(vertices, faces):
@@ -126,15 +162,23 @@ def _corner_normals(vertices, faces):
 
 
 def _material_of(mesh):
-    """(BGR colour, gloss) from a glTF material; a missing roughness means matte."""
+    """(BGR colour, gloss, BGR texture or None) from a glTF material.
+
+    A missing roughness means matte. A texture without a colour factor is shown
+    as it is (factor white).
+    """
     material = getattr(mesh.visual, "material", None)
     color = getattr(material, "baseColorFactor", None)
     roughness = getattr(material, "roughnessFactor", None)
+    image = getattr(material, "baseColorTexture", None)
     gloss = 0.0 if roughness is None else float(np.clip(1.0 - roughness, 0.0, 1.0))
+    texture = None
+    if image is not None:
+        texture = np.ascontiguousarray(np.asarray(image.convert("RGB"))[..., ::-1])
     if color is None:
-        return DEFAULT_COLOR_BGR, gloss
+        return (DEFAULT_COLOR_BGR if texture is None else (255, 255, 255)), gloss, texture
     red, green, blue = (int(channel) for channel in np.asarray(color)[:3])
-    return (blue, green, red), gloss
+    return (blue, green, red), gloss, texture
 
 
 def _parts_of(scene):
@@ -145,9 +189,14 @@ def _parts_of(scene):
         if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
             continue
         vertices = trimesh.transform_points(mesh.vertices, transform) * METRES_TO_CM
-        color, gloss = _material_of(mesh)
+        color, gloss, texture = _material_of(mesh)
+        uvs = getattr(mesh.visual, "uv", None)
+        if texture is None or uvs is None:  # one without the other can't be drawn
+            texture = uvs = None
+        else:
+            uvs = np.asarray(uvs, dtype=np.float64)
         parts.append(MeshPart(node, np.asarray(vertices, dtype=np.float64),
-                              np.asarray(mesh.faces, dtype=np.int64), color, gloss))
+                              np.asarray(mesh.faces, dtype=np.int64), color, gloss, uvs, texture))
     return tuple(parts)
 
 

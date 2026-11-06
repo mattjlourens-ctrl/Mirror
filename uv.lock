@@ -641,6 +641,7 @@ dependencies = [
     { name = "mediapipe" },
     { name = "numpy" },
     { name = "opencv-python" },
+    { name = "pillow" },
     { name = "shapely" },
     { name = "trimesh" },
 ]
@@ -653,6 +654,7 @@ requires-dist = [
     { name = "mediapipe", specifier = "==0.10.21" },
     { name = "numpy", specifier = "<2" },
     { name = "opencv-python", specifier = ">=4.8,<5" },
+    { name = "pillow", specifier = ">=10" },
     { name = "shapely", specifier = ">=2.2.0" },
     { name = "trimesh", specifier = ">=5.2.0" },
 ]

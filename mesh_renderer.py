@@ -9,7 +9,11 @@ Each frame, using the same transforms and camera matrix as the wireframe:
    occlusion.py's rasterizer.
 3. Pixels behind the head depth buffer are discarded.
 4. Only the pixels that remain are shaded, so hidden surfaces cost nothing.
-   Normals are interpolated per pixel.
+   Normals and texture coordinates are interpolated per pixel, perspective-
+   correctly, so textures stay fixed to the surface as the head turns.
+   Textures are sampled from the level of their pyramid that matches their size
+   on screen, blending the two nearest, so fine detail averages instead of
+   sparkling when the glasses are small.
 5. Coverage and colour pass through a small filter, softening edges, and are
    blended in. Measured at 720p, this costs a small fraction of supersampling.
 
@@ -42,6 +46,12 @@ DIFFUSE = 0.7
 # strong one would wash the whole front out at that angle.
 SPECULAR = 0.35
 SHININESS_SQUARINGS = 5  # highlight falloff exponent 2**5 = 32
+# Facing the camera, AMBIENT + DIFFUSE * (light . view) is close to 1, so a texture
+# from a front-view photo keeps its colours there. Its baked-in highlights are
+# kept too, so textured parts should be given a modest gloss.
+
+# cv2.remap needs maps under 32767 in each dimension.
+REMAP_ROW_PX = 4096
 
 MAX_RENDER_WIDTH = 420  # pixels across the model's bounding box
 
@@ -57,48 +67,51 @@ def _lerp_to_near(start, end, near_z):
     return point, t
 
 
-def clip_triangles_to_near_plane(corners, normals, colors, gloss, near_z=MIN_DEPTH_CM):
+def clip_triangles_to_near_plane(corners, corner_values, near_z=MIN_DEPTH_CM):
     """Keep the part of each triangle with Z >= near_z, preserving winding.
 
-    A triangle with one corner in front stays one triangle; with two it becomes
-    a quad, split into two triangles.
+    corner_values -- (F, 3, K) values at each corner, such as normals and texture
+        coordinates; they are interpolated along cut edges
+    Returns (corners, corner_values, face): face is each output triangle's input
+    index, for looking up per-face values. A triangle with one corner in front
+    stays one triangle; with two it becomes a quad, split into two triangles.
     """
     in_front = corners[:, :, 2] >= near_z
     count = in_front.sum(axis=1)
     if count.min(initial=3) == 3:
-        return corners, normals, colors, gloss
+        return corners, corner_values, np.arange(len(corners))
 
     whole = np.flatnonzero(count == 3)
-    results = [(corners[whole], normals[whole], colors[whole], gloss[whole])]
+    results = [(corners[whole], corner_values[whole], whole)]
 
     def rolled(rows, first):
         """Rows rotated so corner `first` comes first; rotation keeps the winding."""
         order = (first[:, None] + np.arange(3)) % 3
         index = rows[:, None]
-        return corners[index, order], normals[index, order]
+        return corners[index, order], corner_values[index, order]
 
-    def cut(c_from, c_to, n_from, n_to):
+    def cut(c_from, c_to, v_from, v_to):
         point, t = _lerp_to_near(c_from, c_to, near_z)
-        return point, n_from + (n_to - n_from) * t
+        return point, v_from + (v_to - v_from) * t
 
     single = np.flatnonzero(count == 1)
     if len(single):
-        c, n = rolled(single, in_front[single].argmax(axis=1))
-        c1, n1 = cut(c[:, 0], c[:, 1], n[:, 0], n[:, 1])
-        c2, n2 = cut(c[:, 0], c[:, 2], n[:, 0], n[:, 2])
-        results.append((np.stack((c[:, 0], c1, c2), axis=1), np.stack((n[:, 0], n1, n2), axis=1),
-                        colors[single], gloss[single]))
+        c, v = rolled(single, in_front[single].argmax(axis=1))
+        c1, v1 = cut(c[:, 0], c[:, 1], v[:, 0], v[:, 1])
+        c2, v2 = cut(c[:, 0], c[:, 2], v[:, 0], v[:, 2])
+        results.append((np.stack((c[:, 0], c1, c2), axis=1), np.stack((v[:, 0], v1, v2), axis=1),
+                        single))
 
     double = np.flatnonzero(count == 2)
     if len(double):
         # Rotate so corner 2 is the one behind the plane.
-        c, n = rolled(double, (in_front[double].argmin(axis=1) + 1) % 3)
-        c1, n1 = cut(c[:, 1], c[:, 2], n[:, 1], n[:, 2])
-        c2, n2 = cut(c[:, 0], c[:, 2], n[:, 0], n[:, 2])
-        results.append((np.stack((c[:, 0], c[:, 1], c1), axis=1), np.stack((n[:, 0], n[:, 1], n1), axis=1),
-                        colors[double], gloss[double]))
-        results.append((np.stack((c[:, 0], c1, c2), axis=1), np.stack((n[:, 0], n1, n2), axis=1),
-                        colors[double], gloss[double]))
+        c, v = rolled(double, (in_front[double].argmin(axis=1) + 1) % 3)
+        c1, v1 = cut(c[:, 1], c[:, 2], v[:, 1], v[:, 2])
+        c2, v2 = cut(c[:, 0], c[:, 2], v[:, 0], v[:, 2])
+        results.append((np.stack((c[:, 0], c[:, 1], c1), axis=1),
+                        np.stack((v[:, 0], v[:, 1], v1), axis=1), double))
+        results.append((np.stack((c[:, 0], c1, c2), axis=1), np.stack((v[:, 0], v1, v2), axis=1),
+                        double))
     return tuple(np.concatenate(arrays) for arrays in zip(*results))
 
 
@@ -139,6 +152,51 @@ def _resolve_surface(tri_xy, tri_z, width, height):
     return depth, triangle, weights
 
 
+def _bilinear(image, uvs):
+    """(N, 3) float32 colours at UVs ((0, 0) = bottom-left), clamped at the borders."""
+    height, width = image.shape[:2]
+    count = len(uvs)
+    padded = -(-count // REMAP_ROW_PX) * REMAP_ROW_PX
+    x = np.zeros(padded, dtype=np.float32)
+    y = np.zeros(padded, dtype=np.float32)
+    x[:count] = uvs[:, 0] * width - 0.5
+    y[:count] = (1.0 - uvs[:, 1]) * height - 0.5
+    shape = (-1, min(padded, REMAP_ROW_PX))
+    sampled = cv2.remap(image, x.reshape(shape), y.reshape(shape), cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REPLICATE)
+    return sampled.reshape(-1, 3)[:count].astype(np.float32)
+
+
+def _sample_texture(texture, uvs, level):
+    """Trilinear: blend the two pyramid levels around a fractional level."""
+    levels = texture.levels
+    level = float(np.clip(level, 0.0, len(levels) - 1))
+    finer = int(level)
+    colors = _bilinear(levels[finer], uvs)
+    fraction = level - finer
+    if fraction > 0 and finer + 1 < len(levels):
+        colors += fraction * (_bilinear(levels[finer + 1], uvs) - colors)
+    return colors
+
+
+def _texture_level(texture, uvs, screen_area):
+    """Pyramid level where one texel covers about one pixel, from the visible triangles.
+
+    uvs         -- (T, 3, 2) of triangles using this texture
+    screen_area -- (T,) their area on screen in raster pixels
+    Triangles with no texture area, such as edges mapped onto an outline, are left out.
+    """
+    height, width = texture.levels[0].shape[:2]
+    a, b, c = uvs[:, 0], uvs[:, 1], uvs[:, 2]
+    texel_area = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                        - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1])) * (width * height / 2)
+    useful = texel_area > 1e-6 * width * height
+    if not useful.any() or screen_area[useful].sum() <= 0:
+        return 0.0
+    ratio = np.sqrt(texel_area[useful].sum() / screen_area[useful].sum())
+    return max(0.0, float(np.log2(ratio)))
+
+
 def _shade(normals, base_colors, gloss):
     """Lit BGR colours (float32, 0-255) for unit normals."""
     normals = normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-6)
@@ -159,11 +217,14 @@ def render_mesh(frame, model, accessory_to_face, pose, depth_buffer=None):
     data = model.render_data
     to_camera = pose.transform @ accessory_to_face
     linear, offset = to_camera[:3, :3], to_camera[:3, 3]
-    corners, normals, colors, gloss = clip_triangles_to_near_plane(
-        data.corners @ linear.T + offset,
-        data.normals.astype(np.float32) @ linear.T.astype(np.float32), data.colors, data.gloss)
+    corner_values = np.concatenate(
+        (data.normals.astype(np.float32) @ linear.T.astype(np.float32), data.uvs), axis=2)
+    corners, corner_values, face = clip_triangles_to_near_plane(
+        data.corners @ linear.T + offset, corner_values)
     if len(corners) == 0:
         return False
+    normals, uvs = corner_values[..., :3], corner_values[..., 3:]
+    colors, gloss, texture_ids = data.colors[face], data.gloss[face], data.texture_ids[face]
 
     pixels = project_camera_points(corners.reshape(-1, 3), pose.camera_matrix).reshape(-1, 3, 2)
     image_h, image_w = frame.shape[:2]
@@ -202,9 +263,21 @@ def render_mesh(frame, model, accessory_to_face, pose, depth_buffer=None):
         return False
 
     hit = triangle[covered]
-    pixel_normals = (normals[hit] * weights[covered, :, None]).sum(axis=1)
+    pixel_weights = weights[covered, :, None]
+    pixel_normals = (normals[hit] * pixel_weights).sum(axis=1)
+    base_colors = colors[hit]
+    raster_area = np.abs(area) * (scale_xy[0] * scale_xy[1] / 2)
+    for texture_id in np.unique(texture_ids[hit]):
+        if texture_id < 0:
+            continue
+        texture = data.textures[texture_id]
+        on_texture = texture_ids[hit] == texture_id
+        level = _texture_level(texture, uvs[facing & (texture_ids == texture_id)],
+                               raster_area[facing & (texture_ids == texture_id)])
+        pixel_uvs = (uvs[hit[on_texture]] * pixel_weights[on_texture]).sum(axis=1)
+        base_colors[on_texture] *= _sample_texture(texture, pixel_uvs, level) / 255.0
     color = np.zeros((height * width, 3), dtype=np.float32)
-    color[covered] = _shade(pixel_normals, colors[hit], gloss[hit])
+    color[covered] = _shade(pixel_normals, base_colors, gloss[hit])
     alpha = np.zeros(height * width, dtype=np.float32)
     alpha[covered] = 1.0
 
