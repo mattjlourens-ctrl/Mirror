@@ -2,7 +2,9 @@
 
 Mirror turns a single product photo of glasses into a 3D model and lets you try it on live through your webcam. The glasses follow your head as you move and turn, and disappear behind your head where they should.
 
-Everything is built from classical computer vision and geometry rather than generative AI, and the 3D rendering pipeline is written from scratch in NumPy. That includes projection, rasterization, depth testing, texturing and occlusion; no game engine or graphics API is used.
+Glasses reconstruction uses classical computer vision and geometry, with no machine learning or generative AI, and the desktop 3D rendering pipeline is written from scratch in NumPy. That includes projection, rasterization, depth testing, texturing and occlusion; no game engine or graphics API is used. Face tracking uses MediaPipe, which is a machine-learning model, so Mirror as a whole is not ML-free.
+
+A website (Next.js + FastAPI) turns a product link or uploaded photo into a model automatically and puts it on your face through the browser camera, using the same pose, placement and occlusion maths as the desktop app. Camera frames never leave the browser.
 
 > **Status:** working prototype, under active development.
 
@@ -12,7 +14,8 @@ Everything is built from classical computer vision and geometry rather than gene
 - **3D head-pose estimation:** OpenCV `solvePnP` against a canonical face model gives head rotation and position, and rejects unreliable poses.
 - **Glasses that follow your head:** the model stays aligned through turning, tilting, nodding and moving closer or further away.
 - **Image-to-3D generation:** a frontal product photo becomes a complete model with a curved front, temples and hinges, exported as `.glb`.
-- **No generative AI:** geometry comes from segmentation, contour tracing, Delaunay triangulation, Bézier curves and swept surfaces, so the same photo always gives the same model.
+- **Website:** paste a product link or upload a photo; the backend finds the product photo and builds the model, and the browser shows it live on your face, with no files to manage.
+- **No AI in reconstruction:** geometry comes from segmentation, contour tracing, Delaunay triangulation, Bézier curves and swept surfaces, so the same photo always gives the same model.
 - **Photo-based appearance:** the frame front is textured with the original photo, and unseen surfaces get colours estimated from it.
 - **Face occlusion:** a per-frame depth buffer of the head hides the temples as they pass behind it.
 
@@ -44,7 +47,9 @@ Algorithm details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Trimesh | Mesh construction and GLB import/export |
 | Shapely | Polygon processing and constrained Delaunay triangulation |
 | Pillow | Embedding textures in GLB files |
-| uv | Dependency management |
+| FastAPI, httpx | Web backend and SSRF-safe product-page fetching |
+| Next.js, TypeScript, Tailwind CSS, three.js, MediaPipe Tasks (web) | Website and live in-browser try-on |
+| uv, npm | Dependency management |
 
 ## Installation and Usage
 
@@ -92,6 +97,25 @@ uv run python main.py --model image_to_3d/output/example_3_photo.glb
 
 If the file is missing or invalid, Mirror prints the reason and shows the wireframe glasses instead. Saving to `example_3_photo.glb`, as above, also lets **M** load the model without `--model`.
 
+### Run the website
+
+Requires Node.js 20.9+. In one terminal, start the backend:
+
+```bash
+uv run uvicorn backend.app:app --port 8000
+```
+
+In another, start the website and open http://localhost:3000:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local   # NEXT_PUBLIC_MIRROR_API_URL; npm run dev defaults to http://localhost:8000
+npm run dev
+```
+
+See [frontend/README.md](frontend/README.md) for the API, configuration and deployment.
+
 ### Keyboard controls
 
 | Key | Action |
@@ -132,6 +156,9 @@ Mirror/
 ├── glasses_3d.py             # Procedural wireframe glasses (fallback)
 ├── glasses.py, geometry.py   # 2D overlay and 2D helpers
 ├── validate_appearance.py    # Compares a generated model with its source photo
+├── backend/                  # FastAPI service: uploads, product pages, jobs, model storage
+├── tools/export_web_ar_data.py # Exports the face model and test fixtures for browser try-on
+├── frontend/                 # Next.js website
 ├── image_to_3d/              # Photo → 3D model generator (independent of the live app)
 │   ├── segmentation.py       #   Background removal and opening cleanup
 │   ├── mesh.py, curvature.py #   Outline tracing, extrusion and frame curvature
@@ -147,12 +174,14 @@ Mirror/
 
 ```bash
 uv run python -m unittest discover -s tests
+cd frontend && npm run lint && npm test && npm run build
 ```
 
-The suite has 548 tests, and all pass. It covers:
+The Python suite has 610 tests, and all pass. The frontend tests check the browser try-on maths against the Python implementation. Python and the browser share one source: the face model, constants and fixtures are exported by `uv run python tools/export_web_ar_data.py`, and a test fails if the export is out of date. The Python tests cover:
 
 - **Live app:** pose estimation, coordinate transforms, rasterization, depth testing, near-plane clipping, texturing, head occlusion at frontal, three-quarter and side angles, GLB loading and fit controls.
 - **Generator:** segmentation, geometry generation and validation, texture extraction, UV mapping, GLB export and determinism.
+- **Backend:** uploads and image validation, product-page photo extraction, SSRF protection (private addresses, redirects, DNS pinning), robots.txt, size limits, the job queue, temporary storage, and end-to-end reconstruction checked with the desktop app's own model loader.
 - **Integration:** the real `main.py` loop runs with a simulated camera, simulated key presses and synthetic face landmarks, so the whole app is tested without a webcam.
 
 ## Limitations and Future Work
@@ -163,6 +192,7 @@ The suite has 548 tests, and all pass. It covers:
 - **Hidden surfaces:** one frontal photo can't show the sides, back or temples, so their colours are approximations. Lighting from the original photo stays baked into the texture.
 - **Approximate fit:** the camera focal length is estimated, pose is solved against an average face, and there is no smoothing between frames.
 - **Simplified occlusion:** the head shape behind the face has no ears or hair.
+- **Website:** many retailers block automated access or build their pages with JavaScript, so product links often fall back to uploading a photo. Browser try-on has been tested with a simulated camera only; real-webcam testing is still needed (see [frontend/README.md](frontend/README.md#live-try-on)).
 - **Rendering and performance:** about 26 fps at 640×480 and 16 fps at 1280×720 in testing on a busy machine. There's no lens or transparency rendering yet.
 
 **Possible improvements** (not yet implemented)
@@ -171,4 +201,4 @@ The suite has 548 tests, and all pass. It covers:
 - Pose smoothing and faster rendering at higher resolutions
 - Lens rendering and richer materials
 - Support for photos with non-white backgrounds
-- A glasses catalogue and a web-based interface
+- A glasses catalogue

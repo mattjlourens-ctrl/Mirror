@@ -1,14 +1,8 @@
 import { ApiError } from "@/lib/api";
 import type { Status } from "./status-message";
 
-/** Turns a failed backend call into a status line; "not configured" is information, not an error. */
-export function failureStatus(error: unknown, whatWasValid: string): Status {
-  if (error instanceof ApiError && error.kind === "not-configured") {
-    return {
-      tone: "info",
-      message: `${whatWasValid} Generating glasses needs the Mirror backend, which isn't connected yet.`,
-    };
-  }
+/** Turns a failed backend call into a status line. */
+export function failureStatus(error: unknown): Status {
   if (error instanceof ApiError) {
     return { tone: "error", message: error.message };
   }

@@ -6,18 +6,24 @@ import { StatusMessage, type Status } from "./status-message";
 import { SubmitButton } from "./submit-button";
 import { failureStatus } from "./describe-api-result";
 import { JobProgress } from "./job-progress";
-import { useGlassesJob } from "./use-glasses-job";
+import { useGlassesJob, type JobPhase } from "./use-glasses-job";
 
 type Selected = { file: File; previewUrl: string };
 
-export function ImageUpload({ onReady }: { onReady: (glasses: ReadyGlasses) => void }) {
+export function ImageUpload({
+  onReady,
+  onPhase,
+}: {
+  onReady: (glasses: ReadyGlasses) => void;
+  onPhase: (phase: JobPhase) => void;
+}) {
   const inputId = useId();
   const statusId = useId();
   const fileInput = useRef<HTMLInputElement>(null);
   const [selected, setSelected] = useState<Selected | null>(null);
   const [status, setStatus] = useState<Status>({ tone: "idle" });
   const [dragging, setDragging] = useState(false);
-  const job = useGlassesJob(onReady);
+  const job = useGlassesJob(onReady, onPhase);
 
   // Release the object URL whenever the preview changes or the component unmounts.
   useEffect(() => () => {
@@ -57,14 +63,15 @@ export function ImageUpload({ onReady }: { onReady: (glasses: ReadyGlasses) => v
     }
     job.cancel();
     const signal = job.begin();
-    setStatus({ tone: "loading", message: "Uploading your photo…" });
+    setStatus({ tone: "idle" });
+    job.setState({ phase: "uploading" });
     try {
       const started = await uploadGlassesImage(selected.file, signal);
-      setStatus({ tone: "idle" });
       await job.follow(started, signal);
     } catch (error) {
       if (signal.aborted) return;
-      setStatus(failureStatus(error, "Your image is ready."));
+      job.setState({ phase: "idle" });
+      setStatus(failureStatus(error));
     }
   }
 
@@ -138,7 +145,7 @@ export function ImageUpload({ onReady }: { onReady: (glasses: ReadyGlasses) => v
       )}
 
       <div className="flex justify-end">
-        <SubmitButton loading={status.tone === "loading" || job.state.phase === "preparing"} disabled={!selected}>
+        <SubmitButton loading={job.state.phase === "uploading" || job.state.phase === "preparing"} disabled={!selected}>
           Find Glasses
         </SubmitButton>
       </div>

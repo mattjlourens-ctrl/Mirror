@@ -1,7 +1,7 @@
 import { CircleAlert, CircleCheck, LoaderCircle, RotateCcw } from "lucide-react";
 import type { JobState } from "./use-glasses-job";
 
-/** The source photo with "Preparing your glasses", ready or failed status, and a retry button. */
+/** The source photo with uploading, generating, ready or failed status, and a retry button. */
 export function JobProgress({ state, onRetry }: { state: JobState; onRetry?: () => void }) {
   if (state.phase === "idle") return null;
   const image = state.sourceImageUrl;
@@ -12,16 +12,16 @@ export function JobProgress({ state, onRetry }: { state: JobState; onRetry?: () 
         <img src={image} alt="Photo used for your glasses" className="h-16 w-24 shrink-0 rounded-lg bg-neutral-50 object-contain" />
       )}
       <div className="min-w-0 flex-1 text-sm">
-        {state.phase === "preparing" && (
+        {(state.phase === "uploading" || state.phase === "preparing") && (
           <p className="flex items-center gap-2 font-medium text-neutral-900">
             <LoaderCircle aria-hidden className="size-4 animate-spin text-neutral-500" />
-            Preparing your glasses…
+            {state.phase === "uploading" ? "Uploading image…" : "Generating glasses…"}
           </p>
         )}
         {state.phase === "ready" && (
           <p className="flex items-center gap-2 font-medium text-emerald-700">
             <CircleCheck aria-hidden className="size-4" />
-            Your glasses are ready.
+            Glasses generated. They appear in the live preview below.
           </p>
         )}
         {state.phase === "failed" && (

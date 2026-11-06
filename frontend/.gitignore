@@ -42,3 +42,6 @@ next-env.d.ts
 
 # example env file is safe to commit
 !.env.example
+
+# copied from node_modules and ../face_landmarker.task by scripts/copy-mediapipe-assets.mjs
+/public/mediapipe/

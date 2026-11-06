@@ -3,6 +3,7 @@ import { ImageIcon, Link2 } from "lucide-react";
 import { ProductLinkForm } from "./product-link-form";
 import { ImageUpload } from "./image-upload";
 import type { ReadyGlasses } from "@/lib/api";
+import type { JobPhase } from "./use-glasses-job";
 
 const TABS = [
   { key: "link", label: "Product link", icon: Link2 },
@@ -16,10 +17,12 @@ export function SourceTabs({
   active,
   onActiveChange: setActive,
   onReady,
+  onPhase,
 }: {
   active: TabKey;
   onActiveChange: (tab: TabKey) => void;
   onReady: (glasses: ReadyGlasses) => void;
+  onPhase: (phase: JobPhase) => void;
 }) {
   const baseId = useId();
   const tabRefs = useRef<Record<TabKey, HTMLButtonElement | null>>({ link: null, image: null });
@@ -84,13 +87,14 @@ export function SourceTabs({
           {key === "link" ? (
             <ProductLinkForm
               onReady={onReady}
+              onPhase={onPhase}
               onUseUpload={() => {
                 setActive("image");
                 tabRefs.current.image?.focus();
               }}
             />
           ) : (
-            <ImageUpload onReady={onReady} />
+            <ImageUpload onReady={onReady} onPhase={onPhase} />
           )}
         </div>
       ))}

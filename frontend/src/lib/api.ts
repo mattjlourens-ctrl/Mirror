@@ -1,6 +1,11 @@
+import { resolveApiUrl } from "./api-config";
+import { httpError, networkFailureMessage } from "./api-errors";
+import type { FitHints } from "./ar/auto-fit";
+
 /**
- * Client for the Mirror backend (FastAPI, in ../backend). Until
- * NEXT_PUBLIC_MIRROR_API_URL is set, every call fails with a "not-configured"
+ * Client for the Mirror backend (FastAPI, in ../backend), at
+ * NEXT_PUBLIC_MIRROR_API_URL (http://localhost:8000 during development). A
+ * production build without it fails every call with a "not-configured"
  * ApiError so the UI never fakes a result.
  */
 
@@ -14,6 +19,8 @@ export type Job = {
   /** Absolute URL of the generated model; only for the browser renderer. */
   modelUrl: string | null;
   parts: string[];
+  /** Hints for placing the model on a face; null if unavailable. */
+  fitHints: FitHints | null;
   error: { code: string; message: string } | null;
 };
 
@@ -29,9 +36,10 @@ export type ProductLookup =
   | { status: "choose"; candidates: Candidate[] };
 
 /** A finished model, ready to hand to the try-on view. */
-export type ReadyGlasses = { jobId: string; modelUrl: string; sourceImageUrl: string };
+export type ReadyGlasses = { jobId: string; modelUrl: string; sourceImageUrl: string; fitHints: FitHints | null };
 
-export type ApiErrorKind = "not-configured" | "network" | "http" | "invalid-response" | "timeout";
+/** "network": backend not answering; "blocked": backend up but refused this page (CORS). */
+export type ApiErrorKind = "not-configured" | "network" | "blocked" | "http" | "invalid-response" | "timeout";
 
 export class ApiError extends Error {
   constructor(
@@ -45,8 +53,8 @@ export class ApiError extends Error {
   }
 }
 
-// Read directly so Next.js inlines the value at build time.
-const API_URL = process.env.NEXT_PUBLIC_MIRROR_API_URL?.trim().replace(/\/+$/, "") ?? "";
+// Read directly so Next.js inlines the values at build time.
+const API_URL = resolveApiUrl(process.env.NEXT_PUBLIC_MIRROR_API_URL, process.env.NODE_ENV);
 
 export function isBackendConfigured(): boolean {
   return API_URL !== "";
@@ -58,7 +66,10 @@ function absolute(path: string): string {
 
 async function request<T>(path: string, init: RequestInit): Promise<T> {
   if (!isBackendConfigured()) {
-    throw new ApiError("not-configured", "The Mirror backend isn't connected yet.");
+    throw new ApiError(
+      "not-configured",
+      "This site has no Mirror backend configured. Set NEXT_PUBLIC_MIRROR_API_URL and rebuild.",
+    );
   }
 
   let response: Response;
@@ -66,22 +77,31 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
     response = await fetch(absolute(path), init);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw error;
-    throw new ApiError("network", "Couldn't reach Mirror. Check your connection and try again.");
+    // The browser reports "server down" and "CORS refused" the same way; a
+    // no-cors probe tells them apart without reading anything.
+    const backendResponds = await fetch(absolute("/api/health"), { mode: "no-cors", cache: "no-store" }).then(
+      () => true,
+      () => false,
+    );
+    throw new ApiError(
+      backendResponds ? "blocked" : "network",
+      networkFailureMessage({
+        backendResponds,
+        apiUrl: API_URL,
+        pageOrigin: window.location.origin,
+        dev: process.env.NODE_ENV !== "production",
+      }),
+    );
   }
 
   if (!response.ok) {
-    let message = `Something went wrong (${response.status}). Please try again.`;
-    let code: string | undefined;
+    let body: unknown = null;
     try {
-      const detail = (await response.json())?.detail;
-      if (typeof detail === "string") message = detail;
-      else if (detail && typeof detail.message === "string") {
-        message = detail.message;
-        code = typeof detail.code === "string" ? detail.code : undefined;
-      }
+      body = await response.json();
     } catch {
-      // Not JSON; keep the generic message.
+      // Not JSON; httpError falls back to the status code.
     }
+    const { message, code } = httpError(response.status, body, absolute(path));
     throw new ApiError("http", message, response.status, code);
   }
 
@@ -98,6 +118,7 @@ type RawJob = {
   source_image_url: string;
   model_url: string | null;
   parts: string[];
+  fit: { lens_centers_cm: [number, number][] } | null;
   error: { code: string; message: string } | null;
 };
 
@@ -110,6 +131,7 @@ function toJob(raw: RawJob): Job {
     sourceImageUrl: absolute(raw.source_image_url),
     modelUrl: raw.model_url ? absolute(raw.model_url) : null,
     parts: raw.parts,
+    fitHints: raw.fit ? { lensCentersCm: raw.fit.lens_centers_cm } : null,
     error: raw.error,
   };
 }
@@ -175,7 +197,7 @@ export async function waitForJob(job: Job, signal?: AbortSignal): Promise<Job> {
   let current = job;
   while (current.status === "queued" || current.status === "processing") {
     if (Date.now() - started > JOB_TIMEOUT_MS) {
-      throw new ApiError("timeout", "Preparing your glasses is taking too long. Please try again.");
+      throw new ApiError("timeout", "Generating glasses is taking too long. Please try again.");
     }
     await sleep(POLL_INTERVAL_MS, signal);
     current = await getJob(current.id, signal);
@@ -185,6 +207,6 @@ export async function waitForJob(job: Job, signal?: AbortSignal): Promise<Job> {
 
 export function readyGlasses(job: Job): ReadyGlasses | null {
   return job.status === "succeeded" && job.modelUrl
-    ? { jobId: job.id, modelUrl: job.modelUrl, sourceImageUrl: job.sourceImageUrl }
+    ? { jobId: job.id, modelUrl: job.modelUrl, sourceImageUrl: job.sourceImageUrl, fitHints: job.fitHints }
     : null;
 }

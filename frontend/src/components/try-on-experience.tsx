@@ -4,12 +4,15 @@ import { useCallback, useState } from "react";
 import type { ReadyGlasses } from "@/lib/api";
 import { CameraPreview } from "./camera-preview";
 import { SourceTabs, type TabKey } from "./source-tabs";
+import type { JobPhase } from "./use-glasses-job";
 
 /** Connects the source forms to the preview: a finished model goes straight to try-on. */
 export function TryOnExperience() {
   const [tab, setTab] = useState<TabKey>("link");
   const [glasses, setGlasses] = useState<ReadyGlasses | null>(null);
+  const [jobPhase, setJobPhase] = useState<JobPhase>("idle");
   const handleReady = useCallback((ready: ReadyGlasses) => setGlasses(ready), []);
+  const handlePhase = useCallback((phase: JobPhase) => setJobPhase(phase), []);
 
   return (
     <>
@@ -20,9 +23,9 @@ export function TryOnExperience() {
           </h1>
           <p className="text-base text-neutral-500 sm:text-lg">Paste a product link or upload a picture to get started.</p>
         </div>
-        <SourceTabs active={tab} onActiveChange={setTab} onReady={handleReady} />
+        <SourceTabs active={tab} onActiveChange={setTab} onReady={handleReady} onPhase={handlePhase} />
       </section>
-      <CameraPreview glasses={glasses} />
+      <CameraPreview glasses={glasses} jobPhase={jobPhase} />
     </>
   );
 }

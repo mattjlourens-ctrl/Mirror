@@ -7,13 +7,15 @@ import { SubmitButton } from "./submit-button";
 import { errorMessage, failureStatus, suggestsUpload } from "./describe-api-result";
 import { CandidatePicker } from "./candidate-picker";
 import { JobProgress } from "./job-progress";
-import { useGlassesJob } from "./use-glasses-job";
+import { useGlassesJob, type JobPhase } from "./use-glasses-job";
 
 export function ProductLinkForm({
   onReady,
+  onPhase,
   onUseUpload,
 }: {
   onReady: (glasses: ReadyGlasses) => void;
+  onPhase: (phase: JobPhase) => void;
   onUseUpload: () => void;
 }) {
   const inputId = useId();
@@ -23,7 +25,7 @@ export function ProductLinkForm({
   const [offerUpload, setOfferUpload] = useState(false);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [chosen, setChosen] = useState<Candidate | null>(null);
-  const job = useGlassesJob(onReady);
+  const job = useGlassesJob(onReady, onPhase);
 
   async function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -46,7 +48,7 @@ export function ProductLinkForm({
       if (lookup.status === "processing") await job.follow(lookup.job, signal);
     } catch (error) {
       if (signal.aborted) return;
-      setStatus(failureStatus(error, "That link looks good."));
+      setStatus(failureStatus(error));
       setOfferUpload(suggestsUpload(error));
     }
   }

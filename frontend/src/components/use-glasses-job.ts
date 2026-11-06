@@ -2,8 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { readyGlasses, waitForJob, type Job, type ReadyGlasses } from "@/lib/api";
 import { errorMessage } from "./describe-api-result";
 
+export type JobPhase = "idle" | "uploading" | "preparing" | "ready" | "failed";
+
 export type JobState =
   | { phase: "idle" }
+  | { phase: "uploading"; sourceImageUrl?: undefined }
   | { phase: "preparing"; sourceImageUrl: string }
   | { phase: "ready"; sourceImageUrl: string }
   | { phase: "failed"; sourceImageUrl?: string; message: string };
@@ -13,11 +16,12 @@ export type JobState =
  * `onReady`. `start` takes a function that creates the job, so callers can
  * retry by calling it again.
  */
-export function useGlassesJob(onReady: (glasses: ReadyGlasses) => void) {
+export function useGlassesJob(onReady: (glasses: ReadyGlasses) => void, onPhase?: (phase: JobPhase) => void) {
   const [state, setState] = useState<JobState>({ phase: "idle" });
   const controller = useRef<AbortController | null>(null);
 
   useEffect(() => () => controller.current?.abort(), []);
+  useEffect(() => onPhase?.(state.phase), [state.phase, onPhase]);
 
   const cancel = useCallback(() => {
     controller.current?.abort();

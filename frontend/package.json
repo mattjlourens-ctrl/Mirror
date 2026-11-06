@@ -7,9 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test src/lib/*.test.ts"
+    "test": "node --test \"src/lib/**/*.test.ts\"",
+    "predev": "node scripts/copy-mediapipe-assets.mjs",
+    "prebuild": "node scripts/copy-mediapipe-assets.mjs"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.21",
     "lucide-react": "^1.69.0",
     "next": "16.4.5",
     "react": "19.3.0",
